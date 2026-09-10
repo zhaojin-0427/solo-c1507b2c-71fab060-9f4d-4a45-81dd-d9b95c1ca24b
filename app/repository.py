@@ -747,3 +747,234 @@ def _event_row(row: Any) -> dict[str, Any]:
 def _is_unique(exc: Exception) -> bool:
     import sqlite3
     return isinstance(exc, sqlite3.IntegrityError) and "UNIQUE" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Sequential analysis plans + checkpoints
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SequentialPlan:
+    id: int
+    plan_key: str
+    experiment_key: str
+    version_number: int
+    metric_key: str
+    control_variant_key: str
+    target_variant_key: str
+    hypothesis: str
+    direction: str
+    alpha: float
+    max_sample_size: int
+    planned_checks: int
+    conditional_power_threshold: float
+    boundary_type: str
+    design_assumptions: Optional[dict[str, Any]]
+    control_share: float
+    target_share: float
+    computed: dict[str, Any]
+    created_at: str
+
+
+def _row_to_seq_plan(row: Any) -> SequentialPlan:
+    return SequentialPlan(
+        id=row["id"], plan_key=row["plan_key"],
+        experiment_key=row["experiment_key"],
+        version_number=row["version_number"],
+        metric_key=row["metric_key"],
+        control_variant_key=row["control_variant_key"],
+        target_variant_key=row["target_variant_key"],
+        hypothesis=row["hypothesis"], direction=row["direction"],
+        alpha=row["alpha"], max_sample_size=row["max_sample_size"],
+        planned_checks=row["planned_checks"],
+        conditional_power_threshold=row["conditional_power_threshold"],
+        boundary_type=row["boundary_type"],
+        design_assumptions=(json.loads(row["design_assumptions_json"])
+                            if row["design_assumptions_json"] else None),
+        control_share=row["control_share"],
+        target_share=row["target_share"],
+        computed=json.loads(row["computed_json"]),
+        created_at=row["created_at"])
+
+
+def create_sequential_plan(spec: Any) -> SequentialPlan:
+    try:
+        with transaction() as tx:
+            cur = tx.execute(
+                "INSERT INTO sequential_plans (plan_key, experiment_key, "
+                " version_number, metric_key, control_variant_key, "
+                " target_variant_key, hypothesis, direction, alpha, "
+                " max_sample_size, planned_checks, conditional_power_threshold, "
+                " boundary_type, design_assumptions_json, control_share, "
+                " target_share, computed_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (spec["plan_key"], spec["experiment_key"],
+                 spec["version_number"], spec["metric_key"],
+                 spec["control_variant_key"], spec["target_variant_key"],
+                 spec["hypothesis"], spec["direction"], spec["alpha"],
+                 spec["max_sample_size"], spec["planned_checks"],
+                 spec["conditional_power_threshold"], spec["boundary_type"],
+                 (json.dumps(spec["design_assumptions"])
+                  if spec["design_assumptions"] is not None else None),
+                 spec["control_share"], spec["target_share"],
+                 json.dumps(spec["computed"]), to_iso(utcnow())))
+            plan_id = cur.lastrowid
+    except Exception as exc:
+        if _is_unique(exc):
+            msg = str(exc)
+            if "plan_key" in msg:
+                raise ConflictError(
+                    "sequential_plan_exists",
+                    f"sequential plan {spec['plan_key']!r} already exists")
+            raise ConflictError(
+                "sequential_plan_exists_for_metric",
+                f"a sequential plan already exists for "
+                f"{spec['experiment_key']!r} v{spec['version_number']} "
+                f"metric {spec['metric_key']!r}")
+        raise
+    return get_sequential_plan_by_id(plan_id)
+
+
+def get_sequential_plan_by_id(plan_id: int) -> SequentialPlan:
+    row = get_conn().execute(
+        "SELECT * FROM sequential_plans WHERE id = ?", (plan_id,)
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"sequential plan id {plan_id} not found")
+    return _row_to_seq_plan(row)
+
+
+def get_sequential_plan(plan_key: str) -> SequentialPlan:
+    row = get_conn().execute(
+        "SELECT * FROM sequential_plans WHERE plan_key = ?", (plan_key,)
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"sequential plan {plan_key!r} not found")
+    return _row_to_seq_plan(row)
+
+
+def get_sequential_plan_for_metric(experiment_key: str, version_number: int,
+                                   metric_key: str
+                                   ) -> Optional[SequentialPlan]:
+    row = get_conn().execute(
+        "SELECT * FROM sequential_plans WHERE experiment_key = ? "
+        "AND version_number = ? AND metric_key = ?",
+        (experiment_key, version_number, metric_key)).fetchone()
+    return _row_to_seq_plan(row) if row else None
+
+
+def list_sequential_plans(experiment_key: str) -> list[SequentialPlan]:
+    get_experiment(experiment_key)  # 404 early
+    rows = get_conn().execute(
+        "SELECT * FROM sequential_plans WHERE experiment_key = ? "
+        "ORDER BY created_at, plan_key", (experiment_key,)).fetchall()
+    return [_row_to_seq_plan(r) for r in rows]
+
+
+def count_exposures_before(experiment_key: str, version_number: int,
+                           cutoff_iso: str) -> int:
+    """Enrolled exposure rows of one version recorded strictly before cutoff."""
+    row = get_conn().execute(
+        "SELECT COUNT(*) FROM exposures WHERE experiment_key = ? "
+        "AND version_number = ? AND enrolled = 1 AND recorded_at < ?",
+        (experiment_key, version_number, cutoff_iso)).fetchone()
+    return int(row[0])
+
+
+def insert_checkpoint(plan_key: str, sequence: int, cutoff_iso: str,
+                      information_time: float, recommendation: str,
+                      result: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Insert a checkpoint snapshot; duplicate cutoff re-serves the stored row.
+
+    Returns (inserted_now, stored_row_dict) — on a duplicate cutoff the first
+    snapshot is returned unchanged, regardless of any later data.
+    """
+    try:
+        with transaction() as tx:
+            cur = tx.execute(
+                "INSERT INTO sequential_checkpoints (plan_key, sequence, "
+                " cutoff_at, information_time, recommendation, result_json, "
+                " created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (plan_key, sequence, cutoff_iso, information_time,
+                 recommendation, json.dumps(result), to_iso(utcnow())))
+            cp_id = cur.lastrowid
+    except Exception as exc:
+        if not _is_unique(exc):
+            raise
+        return False, get_checkpoint_at(plan_key, cutoff_iso)
+    return True, get_checkpoint_by_id(cp_id)
+
+
+def get_checkpoint_by_id(cp_id: int) -> dict[str, Any]:
+    row = get_conn().execute(
+        "SELECT * FROM sequential_checkpoints WHERE id = ?", (cp_id,)
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"checkpoint id {cp_id} not found")
+    return _checkpoint_row(row)
+
+
+def get_checkpoint_at(plan_key: str, cutoff_iso: str) -> dict[str, Any]:
+    row = get_conn().execute(
+        "SELECT * FROM sequential_checkpoints WHERE plan_key = ? "
+        "AND cutoff_at = ?", (plan_key, cutoff_iso)).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"checkpoint at {cutoff_iso} for plan {plan_key!r} not found")
+    return _checkpoint_row(row)
+
+
+def list_checkpoints(plan_key: str) -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT * FROM sequential_checkpoints WHERE plan_key = ? "
+        "ORDER BY sequence", (plan_key,)).fetchall()
+    return [_checkpoint_row(r) for r in rows]
+
+
+def _checkpoint_row(row: Any) -> dict[str, Any]:
+    d = dict(row)
+    d["result"] = json.loads(d.pop("result_json"))
+    return d
+
+
+def enrolled_exposures_before(experiment_key: str, version_number: int,
+                              cutoff_iso: str) -> list[dict[str, Any]]:
+    sql = ("SELECT id, experiment_key, version_number, user_key, variant_key, "
+           " enrolled, recorded_at FROM exposures "
+           "WHERE experiment_key = ? AND enrolled = 1 AND recorded_at < ?")
+    params: list[Any] = [experiment_key, cutoff_iso]
+    if version_number is not None:
+        sql += " AND version_number = ?"
+        params.append(version_number)
+    sql += " ORDER BY id"
+    return [dict(r) for r in get_conn().execute(sql, params).fetchall()]
+
+
+def version_exposures_before(experiment_key: str, version_number: int,
+                             cutoff_iso: str) -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT id, experiment_key, version_number, user_key, variant_key, "
+        "enrolled, recorded_at FROM exposures "
+        "WHERE experiment_key = ? AND version_number = ? "
+        "AND recorded_at < ? ORDER BY id",
+        (experiment_key, version_number, cutoff_iso)).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["enrolled"] = bool(d["enrolled"])
+        result.append(d)
+    return result
+
+
+def events_before(experiment_key: str, event_name: str,
+                  cutoff_iso: str) -> list[dict[str, Any]]:
+    """Deduplicated events with occurred_at strictly before cutoff."""
+    rows = get_conn().execute(
+        "SELECT id, event_key, user_key, event_name, occurred_at, value, "
+        " value_present, value_valid FROM result_events "
+        "WHERE experiment_key = ? AND event_name = ? AND occurred_at < ? "
+        "ORDER BY occurred_at, id",
+        (experiment_key, event_name, cutoff_iso)).fetchall()
+    return [_event_row(r) for r in rows]
+

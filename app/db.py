@@ -86,6 +86,84 @@ CREATE TABLE IF NOT EXISTS result_events (
     received_at    TEXT NOT NULL
 );
 
+-- ---------------------------------------------------------------------------
+-- Sequential (group-sequential) analysis plans and checkpoints.
+--
+-- A plan is written BEFORE any exposure on the analyzed version and is
+-- immutable afterwards: there is no UPDATE endpoint at all, and the triggers
+-- below block in-place changes at the storage layer. Checkpoints are frozen
+-- snapshots: their result_json is fixed at submit time and later events can
+-- never alter it (the same cutoff is re-served from storage verbatim).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS sequential_plans (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_key                   TEXT NOT NULL UNIQUE,
+    experiment_key             TEXT NOT NULL REFERENCES experiments(key),
+    version_number             INTEGER NOT NULL,
+    metric_key                 TEXT NOT NULL,
+    control_variant_key        TEXT NOT NULL,
+    target_variant_key         TEXT NOT NULL,
+    hypothesis                 TEXT NOT NULL CHECK (hypothesis IN ('one_sided', 'two_sided')),
+    direction                  TEXT NOT NULL CHECK (direction IN ('maximize', 'minimize')),
+    alpha                      REAL NOT NULL,
+    max_sample_size            INTEGER NOT NULL,
+    planned_checks             INTEGER NOT NULL,
+    conditional_power_threshold REAL NOT NULL,
+    boundary_type              TEXT NOT NULL CHECK (boundary_type IN ('pocock', 'obrien_fleming')),
+    design_assumptions_json    TEXT,
+    control_share              REAL NOT NULL,
+    target_share               REAL NOT NULL,
+    computed_json              TEXT NOT NULL,
+    created_at                 TEXT NOT NULL,
+    UNIQUE (experiment_key, version_number, metric_key)
+);
+
+CREATE TABLE IF NOT EXISTS sequential_checkpoints (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_key         TEXT NOT NULL REFERENCES sequential_plans(plan_key),
+    sequence         INTEGER NOT NULL,
+    cutoff_at        TEXT NOT NULL,
+    information_time REAL NOT NULL,
+    recommendation   TEXT NOT NULL,
+    result_json      TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    UNIQUE (plan_key, cutoff_at),
+    UNIQUE (plan_key, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_seq_plans_exp
+    ON sequential_plans (experiment_key, version_number);
+CREATE INDEX IF NOT EXISTS idx_seq_cp_plan
+    ON sequential_checkpoints (plan_key, sequence);
+
+-- Plans and checkpoints are write-once: no UPDATE is ever needed (a plan's
+-- active/terminal state is derived from its latest checkpoint), so the
+-- storage layer refuses every modification or deletion outright.
+CREATE TRIGGER IF NOT EXISTS trg_seq_plan_no_update
+BEFORE UPDATE ON sequential_plans
+BEGIN
+    SELECT RAISE(ABORT, 'sequential plans are immutable: create a new plan');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_seq_plan_no_delete
+BEFORE DELETE ON sequential_plans
+BEGIN
+    SELECT RAISE(ABORT, 'sequential plans are immutable and cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_seq_checkpoint_no_update
+BEFORE UPDATE ON sequential_checkpoints
+BEGIN
+    SELECT RAISE(ABORT, 'checkpoint snapshots are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_seq_checkpoint_no_delete
+BEFORE DELETE ON sequential_checkpoints
+BEGIN
+    SELECT RAISE(ABORT, 'checkpoint snapshots are immutable and cannot be deleted');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_versions_exp_status
     ON experiment_versions (experiment_key, status);
 CREATE INDEX IF NOT EXISTS idx_versions_ns

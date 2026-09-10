@@ -22,6 +22,8 @@ from .routers import experiments as experiments_router
 from .routers.exposures import router as exposures_router
 from .routers.exposures import router_lookup as exposure_lookup_router
 from .routers.metrics import router as metrics_router
+from .routers.sequential import plans_router as sequential_plans_router
+from .routers.sequential import router as sequential_router
 
 
 def create_app() -> FastAPI:
@@ -73,6 +75,11 @@ def create_app() -> FastAPI:
     app.include_router(exposures_router, prefix=api)
     app.include_router(exposure_lookup_router, prefix=api)
     app.include_router(metrics_router, prefix=api)
+    # global plan-key routes must be registered before the experiment-scoped
+    # /experiments/... routers do not clash here; ordering is irrelevant since
+    # prefixes differ, but plans_router is included first for clarity.
+    app.include_router(sequential_plans_router, prefix=api)
+    app.include_router(sequential_router, prefix=api)
     return app
 
 
