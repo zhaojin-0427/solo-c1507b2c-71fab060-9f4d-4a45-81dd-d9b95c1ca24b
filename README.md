@@ -153,6 +153,80 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
   只统计某配置版本；`GET /experiments/{key}/exposures` 支持按 `variant` / `user_key` 过滤明细。
 - `GET /exposures/idempotency/{key}` 取回任意一次决策的完整轨迹与其采用的**配置版本**。
 
+## 指标归因与效果分析
+
+在版本化分流之上，可为**每个配置版本**定义不可变指标，上报结果事件，查询带统计推断的效果分析。
+
+### 指标定义（绑定版本、不可变）
+
+`POST /api/experiments/{key}/versions/{v}/metrics`：
+
+| 字段 | 说明 |
+|---|---|
+| `metric_key` | 版本内唯一（同 key 重复定义返回 `409 metric_exists`） |
+| `metric_type` | `binary`（二元转化，事件本身即转化）或 `continuous`（连续数值，取事件 `value`） |
+| `event_name` | 监听的结果事件名 |
+| `attribution_window_seconds` | 归因窗口（秒）：事件须落在曝光后 `[0, window]` 内；`0` 表示不设上限 |
+| `direction` | `maximize` / `minimize`，用于判定提升方向是否 `favorable` |
+| `min_sample_size` | 每变体最小有效样本量，低于则标记 `insufficient_sample` |
+| `srm_threshold` | 样本比例偏差阈值，`\|实际占比-配置占比\|/配置占比` 超过即标记 `srm` |
+
+指标与配置版本同样不可变、不可删除；在新版本上重新定义同名指标是独立指标，
+`GET /api/experiments/{key}/metrics?version=N` 可按版本列出。
+
+### 结果事件上报（幂等去重）
+
+`POST /api/experiments/{key}/events`，载荷携带全局唯一 `event_key`、`user_key`、
+`event_name`、`occurred_at`（缺省为当前 UTC）和连续指标用的可选 `value`：
+
+- **重复 `event_key` 不重复计数**：返回首次存储的原始事件，`duplicate=true`（且 `attributions` 为空）。
+- 首次上报会即时给出针对当前已定义监听指标的**归因预览**（`attributions`），但权威归因在分析时
+  依据不可变行重算——之后再定义指标也能回溯历史事件。
+- `NaN/Infinity` 在 API 边界直接 `400 invalid_value`，绝不入库；缺数值的事件照常存储
+  （`value_present=false`），二元指标忽略 value，连续指标将其计为 `invalid_value` 排除。
+
+### 归因规则
+
+每个事件相对于某版本的某指标，关联到**同一用户、该版本、事件发生时刻之前（含同时刻）
+最近一次已入组曝光**，并给出唯一结论：
+
+| 结论 reason | 含义 |
+|---|---|
+| `attributed` | 命中窗口内的最近入组曝光，计入其变体 |
+| `no_exposure` | 该用户在本版本没有已入组曝光（未入组决策也记录的场景） |
+| `event_before_exposure` | 事件早于该用户任何曝光 |
+| `out_of_window` | 最近曝光存在，但早于归因窗口起点 |
+| `invalid_value` | 连续指标事件缺少有限数值（二元指标不受影响） |
+
+分析只纳入“在该版本有任意曝光记录”的用户事件，因此新版本发布后才出现的用户**不会**串入
+历史版本；`GET /api/experiments/{key}/events` / `…/events/{event_key}` 可查明细。
+
+### 效果分析
+
+`GET /api/experiments/{key}/versions/{v}/metrics/{metric}/analysis?start_at=&end_at=`
+（半开区间 `[start, end)`，可省略任一端；`start >= end` 返回 `400 invalid_time_range`）。
+
+每个变体返回：
+
+- `exposures_used`：该版本去重入组用户数；`valid_samples`：有效样本
+  （二元=去重转化用户，连续=有效归因事件数）。
+- `value`：二元为转化率，连续为均值；`ci95`：95% 置信区间
+  （二元 Wald 正态近似；连续 `mean ± 1.96·s/√n`，样本方差分母 n-1）。
+- 非对照变体的 `lift`：相对对照 `(t-c)/|c|` 与 95% CI
+  （二元用对数率比 `exp(log(p_t/p_c) ± 1.96·√(1/c_t-1/n_t+1/c_c-1/n_c))-1`；
+  连续用 Welch 不配对差值 CI 除以对照均值），以及按 `direction` 计算的 `favorable`。
+  对照为 0、样本不足等无法定义时，对应字段为 `null` 而非报错。
+- `sample_ratio`：配置占比 vs 实际占比、相对偏差与 `srm` 标记（变体级 + `totals.srm` 总标记）。
+- `insufficient_sample`：样本少于 `min_sample_size`（变体级 + `totals.insufficient_sample`）。
+- `events_attributed` 与按原因细分的 `exclusions`；`formula` 给出本变体**实际代入数值**的公式。
+
+顶层 `totals` 提供曝光 / 窗内事件 / 去重事件 / 归因 / 有效样本 / 各原因排除计数的完整对账
+（`归因 + Σ排除 = 窗内事件`），`formulas` 为公式词典，`attribution` 为原因释义。
+
+**确定性与版本隔离**：归因与统计全部基于不可变的曝光、事件行在查询时纯函数重算，事件表由
+`event_key UNIQUE` 去重，因此同一时间范围重复查询结果逐字节一致；指标、曝光、事件连接全部
+带 `version_number`，历史版本分析不受后续发布影响。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -171,6 +245,12 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 | GET | `/api/experiments/{key}/exposures/summary?version=` | 曝光汇总计数 |
 | GET | `/api/experiments/{key}/exposures?variant=&user_key=` | 曝光明细（含轨迹） |
 | GET | `/api/exposures/idempotency/{key}` | 幂等键回查任意决策 |
+| POST | `/api/experiments/{key}/versions/{v}/metrics` | 为版本定义不可变指标（二元/连续、窗口、方向、最小样本量、SRM 阈值） |
+| GET | `/api/experiments/{key}/metrics?version=` | 列出指标定义 |
+| POST | `/api/experiments/{key}/events` | 上报结果事件（event_key 去重，返回即时归因预览） |
+| GET | `/api/experiments/{key}/events?event_name=&user_key=` | 结果事件明细 |
+| GET | `/api/experiments/{key}/events/{event_key}` | 按事件键回查 |
+| GET | `/api/experiments/{key}/versions/{v}/metrics/{metric}/analysis?start_at=&end_at=` | 指标归因与效果分析（比率/均值、提升、95% CI、SRM、样本不足、对账计数与公式） |
 
 所有错误使用统一信封：
 
@@ -203,14 +283,16 @@ app/
   hashing.py         # sha256 稳定双桶
   audience.py        # 受众条件树求值（带求值轨迹）
   validation.py      # 结构校验 + 命名空间/时段互斥校验
-  repository.py      # 数据访问层（实验/版本/曝光）
+  repository.py      # 数据访问层（实验/版本/曝光/指标/结果事件）
+  metrics.py         # 指标归因（最近入组曝光+窗口）与效果统计（CI/提升/SRM）
   engine.py          # 决策流水线 + 幂等曝光写入
   services.py        # 预检 & 模拟
   routers/
     experiments.py   # 实验/版本/分流/批量/模拟
     exposures.py     # 曝光汇总/明细/幂等回查
+    metrics.py       # 指标定义/事件上报/效果分析
   main.py            # FastAPI 装配、统一错误处理
-tests/               # pytest 端到端测试（25 个用例，临时 SQLite）
+tests/               # pytest 端到端测试（53 个用例，临时 SQLite）
 run.py               # 启动入口
 ```
 

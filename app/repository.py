@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import secrets
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -10,7 +11,7 @@ from typing import Any, Optional
 from .db import get_conn, transaction
 from .errors import ConflictError, NotFoundError
 from .schemas import VersionConfigIn
-from .time_utils import to_iso, utcnow
+from .time_utils import parse_iso, to_iso, utcnow
 
 
 @dataclass(frozen=True)
@@ -434,6 +435,264 @@ def _exposure_row(row: Any) -> dict[str, Any]:
     d = dict(row)
     d["enrolled"] = bool(d["enrolled"])
     d["trace"] = json.loads(d.pop("trace_json"))
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Metric definitions (bound to one experiment version, immutable)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MetricDef:
+    id: int
+    experiment_key: str
+    version_number: int
+    metric_key: str
+    metric_type: str
+    event_name: str
+    attribution_window_seconds: int
+    direction: str
+    min_sample_size: int
+    srm_threshold: float
+    created_at: str
+
+
+def create_metric(experiment_key: str, version_number: int,
+                  spec: Any) -> MetricDef:
+    get_experiment(experiment_key)  # 404 if experiment missing
+    version = get_version(experiment_key, version_number)  # 404 if version missing
+    try:
+        with transaction() as tx:
+            cur = tx.execute(
+                "INSERT INTO metric_defs (experiment_key, version_number, "
+                " metric_key, metric_type, event_name, attribution_window_seconds, "
+                " direction, min_sample_size, srm_threshold, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (experiment_key, version_number, spec.metric_key,
+                 spec.metric_type, spec.event_name,
+                 spec.attribution_window_seconds, spec.direction,
+                 spec.min_sample_size, spec.srm_threshold,
+                 to_iso(utcnow())),
+            )
+            metric_id = cur.lastrowid
+    except Exception as exc:
+        if _is_unique(exc):
+            raise ConflictError(
+                "metric_exists",
+                f"metric {spec.metric_key!r} already defined for "
+                f"{experiment_key!r} v{version_number}")
+        raise
+    return get_metric_by_id(metric_id)
+
+
+def get_metric_by_id(metric_id: int) -> MetricDef:
+    row = get_conn().execute(
+        "SELECT * FROM metric_defs WHERE id = ?", (metric_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"metric id {metric_id} not found")
+    return _row_to_metric(row)
+
+
+def get_metric(experiment_key: str, version_number: int,
+               metric_key: str) -> MetricDef:
+    row = get_conn().execute(
+        "SELECT * FROM metric_defs WHERE experiment_key = ? "
+        "AND version_number = ? AND metric_key = ?",
+        (experiment_key, version_number, metric_key),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"metric {metric_key!r} not found for {experiment_key!r} "
+            f"v{version_number}")
+    return _row_to_metric(row)
+
+
+def list_metrics(experiment_key: str,
+                 version_number: Optional[int] = None) -> list[MetricDef]:
+    get_experiment(experiment_key)  # 404 early
+    sql = "SELECT * FROM metric_defs WHERE experiment_key = ?"
+    params: list[Any] = [experiment_key]
+    if version_number is not None:
+        sql += " AND version_number = ?"
+        params.append(version_number)
+    sql += " ORDER BY version_number, metric_key"
+    return [_row_to_metric(r) for r in get_conn().execute(sql, params).fetchall()]
+
+
+def list_matching_metrics(experiment_key: str,
+                          event_name: str) -> list[MetricDef]:
+    """All defined metrics (any version) listening on this event.
+
+    Used for the ingestion-time attribution preview.
+    """
+    rows = get_conn().execute(
+        "SELECT * FROM metric_defs WHERE experiment_key = ? AND event_name = ? "
+        "ORDER BY version_number, metric_key",
+        (experiment_key, event_name),
+    ).fetchall()
+    return [_row_to_metric(r) for r in rows]
+
+
+def _row_to_metric(row: Any) -> MetricDef:
+    return MetricDef(
+        id=row["id"],
+        experiment_key=row["experiment_key"],
+        version_number=row["version_number"],
+        metric_key=row["metric_key"],
+        metric_type=row["metric_type"],
+        event_name=row["event_name"],
+        attribution_window_seconds=row["attribution_window_seconds"],
+        direction=row["direction"],
+        min_sample_size=row["min_sample_size"],
+        srm_threshold=row["srm_threshold"],
+        created_at=row["created_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Result events
+# ---------------------------------------------------------------------------
+
+
+def insert_result_event(event_key: str, experiment_key: str, user_key: str,
+                        event_name: str, occurred_at_iso: str,
+                        value: Optional[float]) -> tuple[bool, dict[str, Any]]:
+    """Idempotent event insert keyed by the globally unique event_key.
+
+    Returns (inserted_now, row_dict). On a duplicate the originally stored
+    event is returned unchanged (re-reporting never re-counts).
+    """
+    value_present = value is not None
+    value_valid = value_present and math.isfinite(value)
+    try:
+        with transaction() as tx:
+            cur = tx.execute(
+                "INSERT INTO result_events (event_key, experiment_key, user_key, "
+                " event_name, occurred_at, value, value_present, value_valid, "
+                " received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_key, experiment_key, user_key, event_name,
+                 occurred_at_iso, value, 1 if value_present else 0,
+                 1 if value_valid else 0, to_iso(utcnow())),
+            )
+            inserted_id = cur.lastrowid
+    except Exception as exc:
+        if not _is_unique(exc):
+            raise
+        return False, get_result_event_by_key(event_key)
+    return True, get_result_event_by_id(inserted_id)
+
+
+def get_result_event_by_key(event_key: str) -> dict[str, Any]:
+    row = get_conn().execute(
+        "SELECT * FROM result_events WHERE event_key = ?", (event_key,),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"event {event_key!r} not found")
+    return _event_row(row)
+
+
+def get_result_event_by_id(event_id: int) -> dict[str, Any]:
+    row = get_conn().execute(
+        "SELECT * FROM result_events WHERE id = ?", (event_id,)).fetchone()
+    return _event_row(row)
+
+
+def list_result_events(experiment_key: str,
+                       event_name: Optional[str] = None,
+                       user_key: Optional[str] = None,
+                       limit: int = 100) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM result_events WHERE experiment_key = ?"
+    params: list[Any] = [experiment_key]
+    if event_name is not None:
+        sql += " AND event_name = ?"
+        params.append(event_name)
+    if user_key is not None:
+        sql += " AND user_key = ?"
+        params.append(user_key)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    return [_event_row(r) for r in get_conn().execute(sql, params).fetchall()]
+
+
+def count_result_events(experiment_key: str, event_name: str) -> int:
+    row = get_conn().execute(
+        "SELECT COUNT(*) FROM result_events "
+        "WHERE experiment_key = ? AND event_name = ?",
+        (experiment_key, event_name),
+    ).fetchone()
+    return int(row[0])
+
+
+def enrolled_exposures(experiment_key: str,
+                       version_number: int) -> list[dict[str, Any]]:
+    """All enrolled exposures of one version, ordered for deterministic attribution."""
+    rows = get_conn().execute(
+        "SELECT id, user_key, variant_key, recorded_at FROM exposures "
+        "WHERE experiment_key = ? AND version_number = ? AND enrolled = 1 "
+        "ORDER BY id",
+        (experiment_key, version_number),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def events_for_analysis(experiment_key: str, event_name: str,
+                        version_number: int,
+                        start_iso: Optional[str],
+                        end_iso: Optional[str]) -> list[dict[str, Any]]:
+    """Matching events (deduplicated by the event_key UNIQUE constraint),
+    scoped to users who have *any* exposure record on ``version_number``:
+    a metric is defined per version, and users never seen under that version
+    (e.g. they only appear after a later publish) cannot belong to its
+    analysis. A user whose version exposure missed the gates stays in scope
+    and is classified as no_exposure by attribution.
+    Ordered by (occurred_at, id) so ties resolve deterministically.
+    """
+    sql = ("SELECT r.id, r.event_key, r.user_key, r.event_name, r.occurred_at, "
+           " r.value, r.value_present, r.value_valid "
+           "FROM result_events r "
+           "WHERE r.experiment_key = ? AND r.event_name = ? "
+           "AND EXISTS (SELECT 1 FROM exposures e "
+           "            WHERE e.experiment_key = r.experiment_key "
+           "            AND e.user_key = r.user_key "
+           "            AND e.version_number = ?)")
+    params: list[Any] = [experiment_key, event_name, version_number]
+    if start_iso is not None:
+        sql += " AND r.occurred_at >= ?"
+        params.append(start_iso)
+    if end_iso is not None:
+        sql += " AND r.occurred_at < ?"  # half-open [start, end)
+        params.append(end_iso)
+    sql += " ORDER BY r.occurred_at, r.id"
+    rows = get_conn().execute(sql, params).fetchall()
+    return [_event_row(r) for r in rows]
+
+
+def total_events_including_duplicates(experiment_key: str, event_name: str,
+                                      start_iso: Optional[str],
+                                      end_iso: Optional[str]) -> int:
+    """Raw ingest attempts in the window (table only holds one row per event_key).
+
+    Duplicate reports are rejected at insert time, so this equals distinct
+    events; the field is kept explicit for audit reconciliation.
+    """
+    sql = ("SELECT COUNT(*) FROM result_events "
+           "WHERE experiment_key = ? AND event_name = ?")
+    params: list[Any] = [experiment_key, event_name]
+    if start_iso is not None:
+        sql += " AND occurred_at >= ?"
+        params.append(start_iso)
+    if end_iso is not None:
+        sql += " AND occurred_at < ?"
+        params.append(end_iso)
+    return int(get_conn().execute(sql, params).fetchone()[0])
+
+
+def _event_row(row: Any) -> dict[str, Any]:
+    d = dict(row)
+    d["value_present"] = bool(d["value_present"])
+    d["value_valid"] = bool(d["value_valid"])
+    d["occurred_at_dt"] = parse_iso(d["occurred_at"])
     return d
 
 

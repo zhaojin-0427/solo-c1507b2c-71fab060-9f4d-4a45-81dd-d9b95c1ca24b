@@ -58,6 +58,34 @@ CREATE TABLE IF NOT EXISTS exposures (
     recorded_at     TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS metric_defs (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_key             TEXT NOT NULL REFERENCES experiments(key),
+    version_number             INTEGER NOT NULL,
+    metric_key                 TEXT NOT NULL,
+    metric_type                TEXT NOT NULL CHECK (metric_type IN ('binary', 'continuous')),
+    event_name                 TEXT NOT NULL,
+    attribution_window_seconds INTEGER NOT NULL,
+    direction                  TEXT NOT NULL CHECK (direction IN ('maximize', 'minimize')),
+    min_sample_size            INTEGER NOT NULL,
+    srm_threshold              REAL NOT NULL,
+    created_at                 TEXT NOT NULL,
+    UNIQUE (experiment_key, version_number, metric_key)
+);
+
+CREATE TABLE IF NOT EXISTS result_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key      TEXT NOT NULL UNIQUE,
+    experiment_key TEXT NOT NULL,
+    user_key       TEXT NOT NULL,
+    event_name     TEXT NOT NULL,
+    occurred_at    TEXT NOT NULL,
+    value          REAL,
+    value_present  INTEGER NOT NULL,
+    value_valid    INTEGER NOT NULL,
+    received_at    TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_exp_status
     ON experiment_versions (experiment_key, status);
 CREATE INDEX IF NOT EXISTS idx_versions_ns
@@ -68,6 +96,16 @@ CREATE INDEX IF NOT EXISTS idx_exposures_exp_var
     ON exposures (experiment_key, variant_key);
 CREATE INDEX IF NOT EXISTS idx_exposures_user
     ON exposures (user_key);
+CREATE INDEX IF NOT EXISTS idx_exposures_exp_ver_user
+    ON exposures (experiment_key, version_number, user_key, enrolled);
+CREATE INDEX IF NOT EXISTS idx_metrics_exp_version
+    ON metric_defs (experiment_key, version_number);
+CREATE INDEX IF NOT EXISTS idx_events_lookup
+    ON result_events (experiment_key, event_name, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_events_user
+    ON result_events (experiment_key, user_key, event_name);
+CREATE INDEX IF NOT EXISTS idx_events_key
+    ON result_events (event_key);
 
 -- Published configuration is frozen: no in-place edits, no re-publishing.
 CREATE TRIGGER IF NOT EXISTS trg_version_published_immutable

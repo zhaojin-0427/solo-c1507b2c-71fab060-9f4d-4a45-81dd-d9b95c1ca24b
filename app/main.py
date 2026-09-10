@@ -21,6 +21,7 @@ from .errors import APIError
 from .routers import experiments as experiments_router
 from .routers.exposures import router as exposures_router
 from .routers.exposures import router_lookup as exposure_lookup_router
+from .routers.metrics import router as metrics_router
 
 
 def create_app() -> FastAPI:
@@ -71,6 +72,7 @@ def create_app() -> FastAPI:
     app.include_router(experiments_router.router, prefix=api)
     app.include_router(exposures_router, prefix=api)
     app.include_router(exposure_lookup_router, prefix=api)
+    app.include_router(metrics_router, prefix=api)
     return app
 
 
