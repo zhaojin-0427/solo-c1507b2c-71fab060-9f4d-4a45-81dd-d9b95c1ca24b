@@ -90,6 +90,65 @@ class VersionConfigIn(StrictModel):
     whitelist: list[WhitelistEntry] = Field(default_factory=list)
     audience: Optional[AudienceNode] = None
     schedules: list[ScheduleWindow] = Field(default_factory=list)
+    continuity: Optional["ContinuitySpecIn"] = Field(
+        default=None,
+        description="reshuffle (default behavior) or inherit the assignment "
+                    "seed and variant order of a published version")
+
+
+class VariantRename(StrictModel):
+    """One entry of a variant rename map on an inherited version."""
+
+    source: str = Field(min_length=1, max_length=64,
+                        description="variant key in the source version")
+    target: str = Field(min_length=1, max_length=64,
+                        description="variant key carrying that group in the new version")
+
+
+class ContinuitySpecIn(StrictModel):
+    """Caller-declared cross-version continuity for a new version."""
+
+    mode: Literal["reshuffle", "inherit"]
+    source_version: Optional[int] = Field(
+        default=None, ge=1,
+        description="published version whose assignment seed and variant "
+                    "order are inherited (mode=inherit only)")
+    source_experiment: Optional[str] = Field(
+        default=None, max_length=64,
+        description="must equal the current experiment key; cross-experiment "
+                    "inheritance is rejected")
+    renames: Optional[list[VariantRename]] = Field(
+        default=None,
+        description="stable rename mapping from source variant keys to new keys")
+
+
+VersionConfigIn.model_rebuild()
+
+
+class ContinuityOut(StrictModel):
+    """Frozen continuity block resolved at create time and stored per version."""
+
+    mode: Literal["reshuffle", "inherit"]
+    source_version: Optional[int] = None
+    source_experiment: Optional[str] = None
+    assignment_seed: Optional[str] = Field(
+        default=None,
+        description="inherited bucketing seed (salt|source_version); null for reshuffle")
+    source_salt: Optional[str] = None
+    variant_order: Optional[list[str]] = Field(
+        default=None,
+        description="effective stable variant order used by bucket ranges")
+    renames: Optional[dict[str, str]] = None
+    source_variants: Optional[list["SourceVariantRow"]] = None
+    source_variant_order: Optional[list[str]] = None
+
+
+class SourceVariantRow(StrictModel):
+    key: str
+    percentage: float
+
+
+ContinuityOut.model_rebuild()
 
 
 class ExperimentCreate(StrictModel):
@@ -126,6 +185,7 @@ class VersionOut(StrictModel):
     traffic_percentage: float
     namespace: str
     config: VersionConfigIn
+    continuity: Optional[ContinuityOut] = None
     created_at: datetime
     published_at: Optional[datetime] = None
 
@@ -219,6 +279,67 @@ class SimulateResponse(StrictModel):
     variants: list[VariantDistributionRow]
     miss_reasons: dict[str, int]
     not_enrolled: int
+
+
+# ---------------------------------------------------------------------------
+# Cross-version migration preview (read-only; never writes exposures)
+# ---------------------------------------------------------------------------
+
+MigrationBucket = Literal["entered", "exited", "retained", "switched",
+                          "not_enrolled"]
+
+
+class MigrationUserIn(StrictModel):
+    user_key: str = Field(min_length=1, max_length=256)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class MigrationPreviewRequest(StrictModel):
+    from_version: int = Field(ge=1, description="published baseline version")
+    to_version: int = Field(ge=1, description="published candidate version")
+    users: list[MigrationUserIn] = Field(min_length=1, max_length=10_000)
+    at: Optional[datetime] = Field(
+        default=None, description="decision instant for both versions (default: now UTC)")
+
+
+class MigrationUserRow(StrictModel):
+    user_key: str
+    from_enrolled: bool
+    to_enrolled: bool
+    from_variant_key: Optional[str] = None
+    to_variant_key: Optional[str] = None
+    from_reason: str
+    to_reason: str
+    bucket: Optional[int] = None
+    category: MigrationBucket
+    change_reason: Optional[str] = Field(
+        default=None,
+        description="continuity reason for switched users: weight_boundary_crossed / "
+                    "variant_added / variant_removed / reshuffled")
+
+
+class MigrationCounts(StrictModel):
+    entered: int = 0
+    exited: int = 0
+    retained: int = 0
+    switched: int = 0
+    not_enrolled: int = 0
+
+
+class MigrationSwitchReasonRow(StrictModel):
+    reason: str
+    users: int
+
+
+class MigrationPreviewResponse(StrictModel):
+    experiment_key: str
+    from_version: int
+    to_version: int
+    users: int
+    counts: MigrationCounts
+    switch_reasons: dict[str, int]
+    samples: dict[str, list[MigrationUserRow]]
+    exposures_written: bool = False
 
 
 # ---------------------------------------------------------------------------

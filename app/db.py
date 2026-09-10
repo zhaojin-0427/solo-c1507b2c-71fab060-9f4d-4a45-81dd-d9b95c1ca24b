@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS experiment_versions (
     config_json     TEXT NOT NULL,
     traffic_percentage REAL NOT NULL,
     namespace       TEXT NOT NULL,
+    continuity_json TEXT,
     created_at      TEXT NOT NULL,
     published_at    TEXT,
     UNIQUE (experiment_key, version)
@@ -186,8 +187,10 @@ CREATE INDEX IF NOT EXISTS idx_events_key
     ON result_events (event_key);
 
 -- Published configuration is frozen: no in-place edits, no re-publishing.
+-- The frozen continuity block (assignment seed, variant order, renames) is
+-- part of that immutable configuration and is covered by the same trigger.
 CREATE TRIGGER IF NOT EXISTS trg_version_published_immutable
-BEFORE UPDATE OF config_json, traffic_percentage, namespace, experiment_key
+BEFORE UPDATE OF config_json, traffic_percentage, namespace, experiment_key, continuity_json
 ON experiment_versions
 WHEN OLD.status = 'published'
 BEGIN
@@ -201,6 +204,39 @@ BEGIN
     SELECT RAISE(ABORT, 'published version cannot be republished');
 END;
 """
+
+# Column/trigger definitions added after the first release. An existing
+# SQLite file predates them: CREATE TABLE IF NOT EXISTS never alters a table
+# and CREATE TRIGGER IF NOT EXISTS never replaces a trigger body, so both are
+# reconciled here, idempotently, on every bootstrap.
+_MIGRATIONS = [
+    (
+        "SELECT 1 FROM pragma_table_info('experiment_versions') "
+        "WHERE name = 'continuity_json'",
+        "ALTER TABLE experiment_versions ADD COLUMN continuity_json TEXT",
+    ),
+]
+
+# The immutability trigger gained continuity_json in its UPDATE OF list; an
+# old database keeps the old trigger body until it is explicitly replaced.
+_TRIGGER_RECREATE = """
+DROP TRIGGER IF EXISTS trg_version_published_immutable;
+CREATE TRIGGER trg_version_published_immutable
+BEFORE UPDATE OF config_json, traffic_percentage, namespace, experiment_key, continuity_json
+ON experiment_versions
+WHEN OLD.status = 'published'
+BEGIN
+    SELECT RAISE(ABORT, 'published version is immutable: create a new version');
+END;
+"""
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    for probe, ddl in _MIGRATIONS:
+        if conn.execute(probe).fetchone() is None:
+            conn.execute(ddl)
+    conn.executescript(_TRIGGER_RECREATE)
+    conn.commit()
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -223,6 +259,7 @@ def get_conn() -> sqlite3.Connection:
         _conn = _connect(settings.db_path)
         _conn.executescript(SCHEMA)
         _conn.commit()
+        _run_migrations(_conn)
     return _conn
 
 
@@ -237,6 +274,7 @@ def init_db(db_path: str | None = None) -> sqlite3.Connection:
     _conn = _connect(settings.db_path)
     _conn.executescript(SCHEMA)
     _conn.commit()
+    _run_migrations(_conn)
     return _conn
 
 

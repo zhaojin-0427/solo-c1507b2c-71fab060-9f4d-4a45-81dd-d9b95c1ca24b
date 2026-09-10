@@ -26,6 +26,7 @@ class LoadedVersion:
     config: VersionConfigIn
     created_at: str
     published_at: Optional[str]
+    continuity: Optional[dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +35,13 @@ class LoadedVersion:
 
 
 def _config_dump(config: VersionConfigIn) -> str:
-    # mode="json" emits ISO-8601 strings for the schedule datetimes
-    return config.model_dump_json()
+    # mode="json" emits ISO-8601 strings for the schedule datetimes. The
+    # continuity declaration is input-only: the resolved/frozen block lives
+    # in its own continuity_json column, so stored config_json never carries
+    # a declaration that could drift from the frozen block.
+    data = config.model_dump(mode="json")
+    data.pop("continuity", None)
+    return json.dumps(data, ensure_ascii=False)
 
 
 def _config_load(raw: str) -> VersionConfigIn:
@@ -104,9 +110,11 @@ def _scalar(sql: str, params: tuple) -> Any:
 
 
 def create_version(experiment_key: str, config: VersionConfigIn,
-                   status: str) -> LoadedVersion:
+                   status: str,
+                   continuity: Optional[dict[str, Any]] = None) -> LoadedVersion:
     exp = get_experiment(experiment_key)
     conn = get_conn()
+    continuity_json = json.dumps(continuity, ensure_ascii=False) if continuity else None
     with transaction() as tx:
         next_version = _scalar(
             "SELECT COALESCE(MAX(version), 0) + 1 FROM experiment_versions "
@@ -115,10 +123,10 @@ def create_version(experiment_key: str, config: VersionConfigIn,
         cur = tx.execute(
             "INSERT INTO experiment_versions "
             "(experiment_key, version, status, config_json, traffic_percentage, "
-            " namespace, created_at, published_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " namespace, continuity_json, created_at, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (experiment_key, next_version, status, _config_dump(config),
-             config.traffic_percentage, exp["namespace"],
+             config.traffic_percentage, exp["namespace"], continuity_json,
              to_iso(utcnow()), published_at),
         )
         version_id = cur.lastrowid
@@ -253,7 +261,9 @@ def load_latest_published_in_namespace(namespace: str
 def create_experiment_with_version(key: str, name: str, namespace: str,
                                    salt: Optional[str],
                                    config: VersionConfigIn,
-                                   status: str) -> tuple[dict[str, Any], LoadedVersion]:
+                                   status: str,
+                                   continuity: Optional[dict[str, Any]] = None
+                                   ) -> tuple[dict[str, Any], LoadedVersion]:
     """Atomically insert experiment + first version.
 
     If the version insert fails (e.g. a DB-level constraint) the whole
@@ -261,6 +271,7 @@ def create_experiment_with_version(key: str, name: str, namespace: str,
     experiment metadata behind and the same key can be retried.
     """
     effective_salt = salt or secrets.token_hex(16)
+    continuity_json = json.dumps(continuity, ensure_ascii=False) if continuity else None
     with transaction() as tx:
         try:
             cur = tx.execute(
@@ -279,10 +290,10 @@ def create_experiment_with_version(key: str, name: str, namespace: str,
         tx.execute(
             "INSERT INTO experiment_versions "
             "(experiment_key, version, status, config_json, traffic_percentage, "
-            " namespace, created_at, published_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " namespace, continuity_json, created_at, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (key, next_version, status, _config_dump(config),
-             config.traffic_percentage, namespace,
+             config.traffic_percentage, namespace, continuity_json,
              to_iso(utcnow()), published_at),
         )
     exp = dict(get_conn().execute(
@@ -313,6 +324,7 @@ def publish_version(experiment_key: str, version: int) -> LoadedVersion:
 
 
 def _row_to_version(row: Any) -> LoadedVersion:
+    raw_continuity = row["continuity_json"] if "continuity_json" in row.keys() else None
     return LoadedVersion(
         id=row["id"],
         experiment_key=row["experiment_key"],
@@ -324,6 +336,7 @@ def _row_to_version(row: Any) -> LoadedVersion:
         config=_config_load(row["config_json"]),
         created_at=row["created_at"],
         published_at=row["published_at"],
+        continuity=json.loads(raw_continuity) if raw_continuity else None,
     )
 
 

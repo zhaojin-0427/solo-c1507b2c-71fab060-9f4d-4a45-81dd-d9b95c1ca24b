@@ -8,7 +8,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Query
 from pydantic import Field
 
-from .. import engine, repository as repo, services
+from .. import engine, migration, repository as repo, services
 from ..errors import ConflictError, ValidationRejected
 from ..schemas import (
     BatchDecideRequest,
@@ -17,6 +17,8 @@ from ..schemas import (
     DecisionResponse,
     ExperimentCreate,
     ExperimentOut,
+    MigrationPreviewRequest,
+    MigrationPreviewResponse,
     PreflightResponse,
     SimulateRequest,
     SimulateResponse,
@@ -51,6 +53,7 @@ def _version_out(loaded: repo.LoadedVersion) -> VersionOut:
         version=loaded.version, status=loaded.status,
         traffic_percentage=loaded.traffic_percentage,
         namespace=loaded.namespace, config=loaded.config,
+        continuity=loaded.continuity,
         created_at=loaded.created_at, published_at=loaded.published_at,
     )
 
@@ -77,16 +80,15 @@ def create_experiment(payload: ExperimentCreate) -> ExperimentOut:
     if payload.config is not None:
         # Validate BEFORE any row is inserted so a rejected create leaves no
         # orphan experiment metadata and the same key can be retried.
-        if payload.publish:
-            issues = services.validate_candidate_for_namespace(
-                payload.key, namespace, payload.config)
-        else:
-            issues = validate_structure(payload.config)
+        block, issues = services.prepare_create(
+            payload.key, namespace, payload.config,
+            publish=payload.publish)
         _reject_if_issues(issues)
         # Atomic experiment + first-version insert (rollback on failure).
         repo.create_experiment_with_version(
             payload.key, payload.name, namespace, payload.salt,
-            payload.config, "published" if payload.publish else "draft")
+            payload.config, "published" if payload.publish else "draft",
+            continuity=block)
     else:
         repo.create_experiment(payload.key, payload.name, namespace,
                                payload.salt)
@@ -113,13 +115,13 @@ def get_experiment(experiment_key: str) -> ExperimentOut:
 def create_version(experiment_key: str, payload: VersionConfigIn,
                    publish: bool = Query(False)) -> VersionOut:
     repo.get_experiment(experiment_key)  # 404 early
-    if publish:
-        issues = services.run_preflight(experiment_key, payload)
-    else:
-        issues = validate_structure(payload)
+    block, issues = services.prepare_version(
+        experiment_key, payload, publish=publish)
     _reject_if_issues(issues)
     status = "published" if publish else "draft"
-    return _version_out(repo.create_version(experiment_key, payload, status))
+    return _version_out(
+        repo.create_version(experiment_key, payload, status,
+                            continuity=block))
 
 
 @router.get("/{experiment_key}/versions", response_model=list[VersionOut],
@@ -141,6 +143,8 @@ def publish_version(experiment_key: str, version: int) -> VersionOut:
     if loaded.status == "published":
         raise ConflictError("version_already_published",
                             f"version {version} is already published and immutable")
+    # Continuity was resolved and frozen when the draft was created; only the
+    # mutex-namespace sweep must be re-run against current published state.
     issues = services.run_preflight(experiment_key, loaded.config)
     _reject_if_issues(issues)
     return _version_out(repo.publish_version(experiment_key, version))
@@ -235,3 +239,14 @@ def simulate(experiment_key: str, payload: SimulateRequest,
         payload.user_key_prefix, at=payload.at, version=version,
     )
     return SimulateResponse.model_validate(result)
+
+
+@router.post("/{experiment_key}/versions/migration-preview",
+             response_model=MigrationPreviewResponse,
+             summary="Compare two published versions for up to 10000 users without writing exposures")
+def migration_preview(experiment_key: str,
+                      payload: MigrationPreviewRequest) -> MigrationPreviewResponse:
+    result = migration.preview_migration(
+        experiment_key, payload.from_version, payload.to_version,
+        payload.users, at=payload.at)
+    return MigrationPreviewResponse.model_validate(result)

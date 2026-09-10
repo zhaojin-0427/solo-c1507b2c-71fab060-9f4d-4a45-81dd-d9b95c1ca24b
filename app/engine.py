@@ -27,9 +27,10 @@ from datetime import datetime
 from typing import Any, Optional
 
 from . import audience as audience_mod
+from . import continuity as continuity_mod
 from . import mutex as mutex_mod
 from . import repository as repo
-from .hashing import BUCKET_SPACE, variant_bucket
+from .hashing import BUCKET_SPACE, assignment_bucket
 from .mutex import NamespaceRing
 from .repository import LoadedVersion
 from .schemas import TraceStep
@@ -52,6 +53,7 @@ class Decision:
     variant_key: Optional[str]
     reason: str
     trace: list[TraceStep] = field(default_factory=list)
+    continuity_info: Optional[dict[str, Any]] = None
 
     def to_dict(self, idempotency_key: Optional[str] = None,
                 exposure_recorded: bool = False) -> dict[str, Any]:
@@ -115,34 +117,15 @@ def _whitelist_lookup(loaded: LoadedVersion, user_key: str) -> Optional[str]:
     return None
 
 
-def _variant_ranges(loaded: LoadedVersion) -> list[dict[str, Any]]:
+def _variant_ranges(loaded: LoadedVersion,
+                    order: list[str]) -> list[dict[str, Any]]:
     """Contiguous ranges on [0, 10000) matching declared percentages.
 
-    The last variant absorbs rounding so ranges cover the full space.
+    Laid out in the effective variant order (the frozen continuity order
+    for inherited versions, sorted-key order otherwise). The last range
+    absorbs rounding so ranges cover the full space.
     """
-    ranges: list[dict[str, Any]] = []
-    cursor = 0
-    sorted_variants = sorted(loaded.config.variants, key=lambda v: v.key)
-    for i, v in enumerate(sorted_variants):
-        if i == len(sorted_variants) - 1:
-            width = BUCKET_SPACE - cursor
-        else:
-            width = round(BUCKET_SPACE * v.percentage / 100.0)
-        ranges.append({
-            "variant_key": v.key,
-            "start": cursor,
-            "end": cursor + width,
-            "percentage": v.percentage,
-        })
-        cursor += width
-    return ranges
-
-
-def _variant_for_bucket(ranges: list[dict[str, Any]], bucket: int) -> dict[str, Any]:
-    for r in ranges:
-        if r["start"] <= bucket < r["end"]:
-            return r
-    return ranges[-1]  # bucket == 10000 can't happen (mod 10000), safety net
+    return continuity_mod.variant_ranges(loaded.config, order)
 
 
 def decide(experiment_key: str, user_key: str,
@@ -187,23 +170,43 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
                   ring: Optional[NamespaceRing] = None) -> Decision:
     at = at or utcnow()
     steps: list[TraceStep] = []
+    params = continuity_mod.effective_assignment(loaded)
     steps.append(trace(
         "version_resolved", "ok",
         version_id=loaded.id, version_number=loaded.version,
         namespace=loaded.namespace, salt=loaded.salt,
         traffic_percentage=loaded.config.traffic_percentage,
+        assignment_seed=params.seed,
+        continuity_mode=(loaded.continuity or {}).get("mode"),
     ))
 
-    # Variant bucket depends only on salt|version|experiment|user; it is
+    # Variant bucket depends only on assignment_seed|experiment|user; it is
     # always present, even on misses, to show where the user would land.
-    bucket = variant_bucket(loaded.experiment_key, loaded.salt,
-                            loaded.version, user_key)
-    ranges = _variant_ranges(loaded)
-    target = _variant_for_bucket(ranges, bucket)
+    # An inherited seed reuses the source version's salt|version material,
+    # which is what keeps users in their groups across versions.
+    bucket = assignment_bucket(loaded.experiment_key, params.seed, user_key)
+    ranges = _variant_ranges(loaded, params.variant_order)
+    target = continuity_mod.variant_for_bucket(ranges, bucket)
+
+    # Cross-version continuity (inherited versions only): compare the same
+    # bucket against the source version's frozen ranges and explain why the
+    # group did or did not move. Recorded before the gates so gate-misses
+    # still carry their would-be migration explanation.
+    continuity_info: Optional[dict[str, Any]] = None
+    if params.inherited:
+        continuity_info = continuity_mod.evaluate_continuity(
+            loaded.continuity, ranges, bucket)
+        steps.append(trace(
+            "continuity",
+            "retained" if continuity_info["status"] == "retained" else "switched",
+            **continuity_info,
+        ))
+
     steps.append(trace("bucket", "computed", bucket=bucket,
                        bucket_space=BUCKET_SPACE,
-                       formula=f"sha256('{loaded.salt}|{loaded.version}|"
+                       formula=f"sha256('{params.seed}|"
                                f"{loaded.experiment_key}|{user_key}') % {BUCKET_SPACE}",
+                       assignment_seed=params.seed,
                        bucketed_variant=target["variant_key"],
                        ranges=ranges))
 
@@ -216,7 +219,8 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
             experiment_key=loaded.experiment_key, version_id=loaded.id,
             version_number=loaded.version, user_key=user_key, bucket=bucket,
             gate_bucket=-1, enrolled=False, variant_key=None,
-            reason="not_in_schedule", trace=steps)
+            reason="not_in_schedule", trace=steps,
+            continuity_info=continuity_info)
     steps.append(trace("schedule", "active", at=at.isoformat(),
                        **(window_detail or {"always_on": True})))
 
@@ -226,11 +230,24 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
         steps.append(trace("whitelist", "matched",
                            user_key=user_key, forced_variant=forced,
                            bucketed_variant=target["variant_key"]))
+        if continuity_info is not None:
+            # The forced variant overrides organic assignment; annotate the
+            # already-recorded continuity step rather than recomputing it.
+            continuity_info = {**continuity_info,
+                               "whitelist_forced_variant": forced,
+                               "change_reason": "whitelist_override"}
+            for i, step in enumerate(steps):
+                if step.step == "continuity":
+                    steps[i] = trace("continuity",
+                                     "retained" if continuity_info["status"] == "retained"
+                                     else "switched", **continuity_info)
+                    break
         return Decision(
             experiment_key=loaded.experiment_key, version_id=loaded.id,
             version_number=loaded.version, user_key=user_key, bucket=bucket,
             gate_bucket=-1, enrolled=True, variant_key=forced,
-            reason="whitelist", trace=steps)
+            reason="whitelist", trace=steps,
+            continuity_info=continuity_info)
     steps.append(trace("whitelist", "miss"))
 
     # 4. audience gate
@@ -243,7 +260,8 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
                 experiment_key=loaded.experiment_key, version_id=loaded.id,
                 version_number=loaded.version, user_key=user_key, bucket=bucket,
                 gate_bucket=-1, enrolled=False, variant_key=None,
-                reason="audience_mismatch", trace=steps)
+                reason="audience_mismatch", trace=steps,
+                continuity_info=continuity_info)
         steps.append(trace("audience", "matched", tree=tree))
     else:
         steps.append(trace("audience", "skipped", reason="no_audience_defined"))
@@ -268,7 +286,8 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
             experiment_key=loaded.experiment_key, version_id=loaded.id,
             version_number=loaded.version, user_key=user_key, bucket=bucket,
             gate_bucket=ring.gate_bucket, enrolled=False, variant_key=None,
-            reason="not_in_traffic", trace=steps)
+            reason="not_in_traffic", trace=steps,
+            continuity_info=continuity_info)
     if owner is None or owner.experiment_key != loaded.experiment_key:
         winner = None if owner is None else {
             "experiment_key": owner.experiment_key,
@@ -285,7 +304,8 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
             experiment_key=loaded.experiment_key, version_id=loaded.id,
             version_number=loaded.version, user_key=user_key, bucket=bucket,
             gate_bucket=ring.gate_bucket, enrolled=False, variant_key=None,
-            reason=reason, trace=steps)
+            reason=reason, trace=steps,
+            continuity_info=continuity_info)
 
     steps.append(trace("traffic", "admitted",
                        traffic_percentage=loaded.config.traffic_percentage,
@@ -301,7 +321,8 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
         experiment_key=loaded.experiment_key, version_id=loaded.id,
         version_number=loaded.version, user_key=user_key, bucket=bucket,
         gate_bucket=ring.gate_bucket, enrolled=True,
-        variant_key=target["variant_key"], reason="bucket", trace=steps)
+        variant_key=target["variant_key"], reason="bucket", trace=steps,
+        continuity_info=continuity_info)
 
 
 # ---------------------------------------------------------------------------
