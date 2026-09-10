@@ -187,19 +187,23 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 
 ### 归因规则
 
-每个事件相对于某版本的某指标，关联到**同一用户、该版本、事件发生时刻之前（含同时刻）
-最近一次已入组曝光**，并给出唯一结论：
+**版本归属（跨版本唯一）**：事件先在该实验**全部版本**中查找同一用户、事件发生时刻之前
+（含同时刻）最近的一次**已入组曝光**——该曝光所属版本是事件的唯一归属版本。因此用户先在 v1
+曝光、发布 v2 后再次曝光，之后的事件只计 v2，**绝不会回写 v1 的历史分析**；反过来，仅有 v1
+曝光的用户，发布 v2 后事件仍计 v1。随后在归属版本上做窗口与数值校验，每个事件给出唯一结论：
 
 | 结论 reason | 含义 |
 |---|---|
-| `attributed` | 命中窗口内的最近入组曝光，计入其变体 |
-| `no_exposure` | 该用户在本版本没有已入组曝光（未入组决策也记录的场景） |
-| `event_before_exposure` | 事件早于该用户任何曝光 |
-| `out_of_window` | 最近曝光存在，但早于归因窗口起点 |
+| `attributed` | 命中归属版本窗口内的最近入组曝光，计入其变体 |
+| `no_exposure` | 事件在本版本审计口径内，但该用户此前无已入组曝光（如被门禁挡下，或事件发生时本版本为线上版本的全新用户）；只计入审计，不参与指标统计 |
+| `event_before_exposure` | 事件早于该用户在本版本的任何曝光 |
+| `out_of_window` | 归属曝光存在，但早于归因窗口起点 |
 | `invalid_value` | 连续指标事件缺少有限数值（二元指标不受影响） |
 
-分析只纳入“在该版本有任意曝光记录”的用户事件，因此新版本发布后才出现的用户**不会**串入
-历史版本；`GET /api/experiments/{key}/events` / `…/events/{event_key}` 可查明细。
+不属于本版本（归属到其他版本）的事件完全不进入本版本口径；无任何曝光记录的“幽灵事件”
+只计入事件发生时**当时线上版本**的 `no_exposure` 审计，同样不参与任何统计。
+`GET /api/experiments/{key}/events` / `…/events/{event_key}` 可查明细，其中事件明细接口会
+校验实验归属——通过错误的实验路径读取其他实验的事件返回 404。
 
 ### 效果分析
 
@@ -209,7 +213,8 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 每个变体返回：
 
 - `exposures_used`：该版本去重入组用户数；`valid_samples`：有效样本
-  （二元=去重转化用户，连续=有效归因事件数）。
+  （二元=**去重转化用户数**，同一用户上报多个不同事件键最多计一次转化；连续=有效归因事件数）。
+  二元的 `events_attributed` 仍如实显示去重后的归因事件条数。
 - `value`：二元为转化率，连续为均值；`ci95`：95% 置信区间
   （二元 Wald 正态近似；连续 `mean ± 1.96·s/√n`，样本方差分母 n-1）。
 - 非对照变体的 `lift`：相对对照 `(t-c)/|c|` 与 95% CI
@@ -217,6 +222,7 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
   连续用 Welch 不配对差值 CI 除以对照均值），以及按 `direction` 计算的 `favorable`。
   对照为 0、样本不足等无法定义时，对应字段为 `null` 而非报错。
 - `sample_ratio`：配置占比 vs 实际占比、相对偏差与 `srm` 标记（变体级 + `totals.srm` 总标记）。
+  **该版本零曝光时无法判断样本比例，`srm` 恒为 false、相对偏差为 null**，不会误报异常。
 - `insufficient_sample`：样本少于 `min_sample_size`（变体级 + `totals.insufficient_sample`）。
 - `events_attributed` 与按原因细分的 `exclusions`；`formula` 给出本变体**实际代入数值**的公式。
 

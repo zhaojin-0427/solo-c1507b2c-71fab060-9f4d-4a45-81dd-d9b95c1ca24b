@@ -17,7 +17,6 @@ from ..schemas import (
     ConfidenceInterval,
     LiftReport,
     MetricAnalysisResponse,
-    MetricAttributionPreview,
     MetricDefOut,
     MetricSpec,
     ResultEventIn,
@@ -106,20 +105,24 @@ def report_event(experiment_key: str,
         matching = repo.list_matching_metrics(experiment_key,
                                               payload.event_name)
         if matching:
-            versions = {m.version_number for m in matching}
-            exposures = {v: repo.enrolled_exposures(experiment_key, v)
-                         for v in versions}
+            # Cross-version view: the nearest prior enrolled exposure of the
+            # user across all versions decides which version owns the event.
+            all_enrolled = repo.enrolled_exposures(experiment_key)
             attributions = metrics_mod.preview_attributions(
-                row, matching, exposures)
+                row, matching, all_enrolled)
 
     return _event_out(row, duplicate=not inserted, attributions=attributions)
 
 
 @router.get("/{experiment_key}/events/{event_key}",
             response_model=ResultEventOut,
-            summary="Retrieve one reported event by its unique event key")
+            summary="Retrieve one reported event through its experiment path")
 def get_event(experiment_key: str, event_key: str) -> ResultEventOut:
-    return _event_out(repo.get_result_event_by_key(event_key))
+    repo.get_experiment(experiment_key)  # 404 on an unknown experiment path
+    # The event must belong to this experiment: a wrong experiment path can
+    # never read another experiment's event.
+    return _event_out(
+        repo.get_result_event_for_experiment(experiment_key, event_key))
 
 
 @router.get("/{experiment_key}/events",
@@ -157,9 +160,25 @@ def analyze(experiment_key: str, version: int, metric_key: str,
         raise APIError(400, "invalid_time_range", str(exc))
 
     events = repo.events_for_analysis(experiment_key, metric.event_name,
-                                      version, start_iso, end_iso)
-    exposures = repo.enrolled_exposures(experiment_key, version)
-    result = metrics_mod.analyze(loaded, metric, events, exposures)
+                                      start_iso, end_iso)
+    # Cross-version enrolled exposures decide version ownership; this
+    # version's own rows (incl. gate misses) feed the denominator and the
+    # in-scope no_exposure audit.
+    all_enrolled = repo.enrolled_exposures(experiment_key)
+    version_rows = repo.all_version_exposures(experiment_key, version)
+    published = repo.published_versions(experiment_key)
+
+    variants = sorted(loaded.config.variants, key=lambda v: v.key)
+    result = metrics_mod.analyze(
+        metric,
+        variant_keys=[v.key for v in variants],
+        control_key=loaded.config.control_variant_key,
+        configured_shares={v.key: v.percentage / 100.0 for v in variants},
+        events=events,
+        version_exposures=version_rows,
+        all_enrolled_exposures=all_enrolled,
+        published_versions=published,
+    )
 
     variant_rows = [
         VariantAnalysisRow(

@@ -497,3 +497,147 @@ def test_event_lookup_and_listing(client):
     listing = client.get(f"{API}/experiments/exp/events",
                          params={"user_key": "u0"}).json()
     assert [e["event_key"] for e in listing["items"]] == ["abc"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the five reviewed defects
+# ---------------------------------------------------------------------------
+
+
+def _two_version_setup(client, *, v1_metric=True, v2_metric=True):
+    """v1 published -> expose u0 -> publish v2 -> expose u0 again."""
+    _experiment(client)
+    if v1_metric:
+        _metric(client, version=1, min_sample=1, srm=0.9)
+    client.post(f"{API}/experiments/exp/versions",
+                params={"publish": True}, json=base_config())
+    if v2_metric:
+        _metric(client, version=2, min_sample=1, srm=0.9)
+
+
+def test_event_after_v2_exposure_is_owned_by_v2_only(client):
+    """Defect 1: one post-v2 event must never be counted on v1 history."""
+    _two_version_setup(client)
+    _expose(client, "u0")  # v1 exposure
+    _expose(client, "u0")  # v2 exposure (same user, newer version)
+    ev = _event(client, "u0", event_key="p1")
+
+    # ingestion preview attributes to v2 only; v1 metric reports not_owned
+    statuses = {(p["version_number"], p["status"], p["reason"])
+                for p in ev["attributions"]}
+    assert (2, "attributed", "attributed") in statuses
+    assert (1, "excluded", "not_owned") in statuses
+
+    v1 = _analysis(client, version=1).json()
+    v2 = _analysis(client, version=2).json()
+    assert v1["totals"]["events_in_window"] == 0
+    assert v1["totals"]["events_attributed"] == 0
+    assert v2["totals"]["events_in_window"] == 1
+    assert v2["totals"]["events_attributed"] == 1
+
+    # and the event is audited exactly once across the two versions
+    assert (v1["totals"]["events_in_window"] + v2["totals"]["events_in_window"]
+            == 1)
+
+
+def test_event_before_v2_but_after_v1_stays_on_v1(client):
+    """The mirror case: pre-v2 events remain attributed to v1 forever."""
+    _experiment(client)
+    _metric(client, version=1, min_sample=1, srm=0.9)
+    _expose(client, "u0")
+    _event(client, "u0", event_key="old")
+    v1_before = _analysis(client, version=1).json()
+
+    client.post(f"{API}/experiments/exp/versions",
+                params={"publish": True}, json=base_config())
+    _metric(client, version=2, min_sample=1, srm=0.9)
+    _expose(client, "u0")  # newer exposure must not move the old event
+    v1_after = _analysis(client, version=1).json()
+    v2 = _analysis(client, version=2).json()
+    assert v1_after == v1_before
+    assert v1_after["totals"]["events_attributed"] == 1
+    assert v2["totals"]["events_in_window"] == 0
+
+
+def test_ghost_event_without_any_exposure_is_audited_as_no_exposure(client):
+    """Defect 2: no-exposure events enter the audit but never statistics."""
+    _two_version_setup(client)
+    # nobody is ever exposed; event occurs while v2 is the live version
+    ev = _event(client, "ghost", event_key="g1")
+    # every listening metric is excluded with no variant/exposure attached
+    assert ev["attributions"]
+    for p in ev["attributions"]:
+        assert p["status"] == "excluded"
+        assert p["variant_key"] is None
+        assert p["exposure_id"] is None
+
+    v2 = _analysis(client, version=2).json()
+    assert v2["totals"]["events_attributed"] == 0
+    assert v2["totals"]["events_in_window"] == 1
+    assert v2["totals"]["excluded"]["no_exposure"] == 1
+    assert v2["totals"]["valid_samples"] == 0
+    # the older version's history is not rewritten by the ghost event
+    v1 = _analysis(client, version=1).json()
+    assert v1["totals"]["events_in_window"] == 0
+    assert v1["totals"]["excluded"]["no_exposure"] == 0
+
+
+def test_two_binary_events_same_user_returns_200_and_counts_once(client):
+    """Defect 3: two distinct event keys from one converting user -> no 500,
+    and the user converts at most once."""
+    _experiment(client)
+    _metric(client, min_sample=1, srm=0.9)
+    d = _expose(client, "u0")
+    _event(client, "u0", event_key="e1")
+    _event(client, "u0", event_key="e2")
+
+    r = _analysis(client)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    variant = next(v for v in body["variants"]
+                   if v["variant_key"] == d["variant_key"])
+    assert variant["exposures_used"] == 1
+    assert variant["valid_samples"] == 1
+    assert variant["value"] == 1.0  # one converting user, not 2/1
+    assert variant["events_attributed"] == 2  # both distinct events audited
+    assert body["totals"]["events_attributed"] == 2
+    assert 0.0 <= variant["ci95"]["lower"] <= 1.0 <= variant["ci95"]["upper"]
+
+
+def test_zero_exposure_version_never_flags_srm(client):
+    """Defect 4: no exposures -> no sample-ratio conclusion at all."""
+    _experiment(client, key="quiet")
+    _metric(client, key="quiet", min_sample=1, srm=0.05)
+    body = _analysis(client, key="quiet").json()
+    assert body["totals"]["exposures_used"] == 0
+    assert body["totals"]["srm"] is False
+    for row in body["variants"]:
+        assert row["sample_ratio"]["srm"] is False
+        assert row["sample_ratio"]["relative_deviation"] is None
+        assert row["sample_ratio"]["observed_share"] == 0.0
+
+
+def test_event_cannot_be_read_via_another_experiment_path(client):
+    """Defect 5: experiment ownership is enforced on event lookup."""
+    _experiment(client, key="alpha")
+    _experiment(client, key="beta")
+    _expose(client, "u0", key="alpha")
+    _event(client, "u0", key="alpha", event_key="secret")
+
+    # wrong experiment path looks like 404, never leaks the stored payload
+    r = client.get(f"{API}/experiments/beta/events/secret")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "not_found"
+    body = r.json()["error"]
+    # no payload fields of alpha's event are present
+    assert "user_key" not in str(body)
+    assert body.get("details") is None
+
+    # owning path works
+    ok = client.get(f"{API}/experiments/alpha/events/secret")
+    assert ok.status_code == 200
+    assert ok.json()["experiment_key"] == "alpha"
+
+    # unknown experiment path is also 404
+    assert client.get(f"{API}/experiments/missing/events/secret").status_code == 404
+

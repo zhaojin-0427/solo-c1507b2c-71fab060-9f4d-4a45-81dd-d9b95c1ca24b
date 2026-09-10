@@ -592,6 +592,23 @@ def get_result_event_by_key(event_key: str) -> dict[str, Any]:
     return _event_row(row)
 
 
+def get_result_event_for_experiment(experiment_key: str,
+                                    event_key: str) -> dict[str, Any]:
+    """Fetch an event through its owning experiment path only.
+
+    An event key under a mismatching experiment path must look like 404,
+    never leak another experiment's data.
+    """
+    row = get_conn().execute(
+        "SELECT * FROM result_events WHERE event_key = ? AND experiment_key = ?",
+        (event_key, experiment_key),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(
+            f"event {event_key!r} not found for experiment {experiment_key!r}")
+    return _event_row(row)
+
+
 def get_result_event_by_id(event_id: int) -> dict[str, Any]:
     row = get_conn().execute(
         "SELECT * FROM result_events WHERE id = ?", (event_id,)).fetchone()
@@ -625,45 +642,76 @@ def count_result_events(experiment_key: str, event_name: str) -> int:
 
 
 def enrolled_exposures(experiment_key: str,
-                       version_number: int) -> list[dict[str, Any]]:
-    """All enrolled exposures of one version, ordered for deterministic attribution."""
-    rows = get_conn().execute(
-        "SELECT id, user_key, variant_key, recorded_at FROM exposures "
-        "WHERE experiment_key = ? AND version_number = ? AND enrolled = 1 "
-        "ORDER BY id",
-        (experiment_key, version_number),
-    ).fetchall()
+                       version_number: Optional[int] = None
+                       ) -> list[dict[str, Any]]:
+    """Enrolled exposures, optionally restricted to one version.
+
+    With no version filter this returns enrolled exposures across EVERY
+    version — the cross-version input that decides which version owns an
+    event.
+    """
+    sql = ("SELECT id, experiment_key, version_number, user_key, variant_key, "
+           " enrolled, recorded_at FROM exposures "
+           "WHERE experiment_key = ? AND enrolled = 1")
+    params: list[Any] = [experiment_key]
+    if version_number is not None:
+        sql += " AND version_number = ?"
+        params.append(version_number)
+    sql += " ORDER BY id"
+    rows = get_conn().execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
+def all_version_exposures(experiment_key: str,
+                          version_number: int) -> list[dict[str, Any]]:
+    """Every exposure row (enrolled and gate-miss) of one version."""
+    rows = get_conn().execute(
+        "SELECT id, experiment_key, version_number, user_key, variant_key, "
+        "enrolled, recorded_at FROM exposures "
+        "WHERE experiment_key = ? AND version_number = ? ORDER BY id",
+        (experiment_key, version_number),
+    ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["enrolled"] = bool(d["enrolled"])
+        result.append(d)
+    return result
+
+
+def published_versions(experiment_key: str) -> list[tuple[str, int]]:
+    """``(published_at ISO, version)`` sorted ascending."""
+    rows = get_conn().execute(
+        "SELECT version, published_at FROM experiment_versions "
+        "WHERE experiment_key = ? AND status = 'published' "
+        "AND published_at IS NOT NULL ORDER BY published_at, version",
+        (experiment_key,),
+    ).fetchall()
+    return [(r["published_at"], r["version"]) for r in rows]
+
+
 def events_for_analysis(experiment_key: str, event_name: str,
-                        version_number: int,
                         start_iso: Optional[str],
                         end_iso: Optional[str]) -> list[dict[str, Any]]:
-    """Matching events (deduplicated by the event_key UNIQUE constraint),
-    scoped to users who have *any* exposure record on ``version_number``:
-    a metric is defined per version, and users never seen under that version
-    (e.g. they only appear after a later publish) cannot belong to its
-    analysis. A user whose version exposure missed the gates stays in scope
-    and is classified as no_exposure by attribution.
-    Ordered by (occurred_at, id) so ties resolve deterministically.
+    """All matching events in the time range, NOT scoped to a version.
+
+    Version ownership is decided in the attribution logic (the user's
+    nearest prior enrolled exposure across versions), not in SQL, so an
+    event cannot be counted on two versions simultaneously. Events are
+    deduplicated by the event_key UNIQUE constraint and ordered by
+    (occurred_at, id) so ties resolve deterministically.
     """
-    sql = ("SELECT r.id, r.event_key, r.user_key, r.event_name, r.occurred_at, "
-           " r.value, r.value_present, r.value_valid "
-           "FROM result_events r "
-           "WHERE r.experiment_key = ? AND r.event_name = ? "
-           "AND EXISTS (SELECT 1 FROM exposures e "
-           "            WHERE e.experiment_key = r.experiment_key "
-           "            AND e.user_key = r.user_key "
-           "            AND e.version_number = ?)")
-    params: list[Any] = [experiment_key, event_name, version_number]
+    sql = ("SELECT id, event_key, user_key, event_name, occurred_at, value, "
+           " value_present, value_valid FROM result_events "
+           "WHERE experiment_key = ? AND event_name = ?")
+    params: list[Any] = [experiment_key, event_name]
     if start_iso is not None:
-        sql += " AND r.occurred_at >= ?"
+        sql += " AND occurred_at >= ?"
         params.append(start_iso)
     if end_iso is not None:
-        sql += " AND r.occurred_at < ?"  # half-open [start, end)
+        sql += " AND occurred_at < ?"  # half-open [start, end)
         params.append(end_iso)
-    sql += " ORDER BY r.occurred_at, r.id"
+    sql += " ORDER BY occurred_at, id"
     rows = get_conn().execute(sql, params).fetchall()
     return [_event_row(r) for r in rows]
 
