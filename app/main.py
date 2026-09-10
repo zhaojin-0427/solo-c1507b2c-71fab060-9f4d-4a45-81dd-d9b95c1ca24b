@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -49,11 +50,17 @@ def create_app() -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_: Request,
                                 exc: RequestValidationError) -> JSONResponse:
+        # jsonable_encoder is essential: pydantic error "ctx" can embed raw
+        # ValueError objects (e.g. schedule end_at <= start_at), which are
+        # not JSON serializable and would otherwise turn the response into
+        # a 500.
         return JSONResponse(
             status_code=400,
-            content={"error": {"code": "bad_request",
-                               "message": "request validation failed",
-                               "details": {"errors": exc.errors()}}},
+            content=jsonable_encoder({
+                "error": {"code": "bad_request",
+                          "message": "request validation failed",
+                          "details": {"errors": exc.errors()}},
+            }),
         )
 
     @app.get("/health", tags=["meta"])

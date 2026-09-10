@@ -1,30 +1,36 @@
-"""Decision engine: explainable, stable traffic splitting.
+"""Decision engine: explainable, stable traffic splitting with mutex namespaces.
 
 Decision order per request (each stage appends a trace step):
 
 1. resolve version (caller-pinned published version or latest published)
 2. schedule gate      — miss reason "not_in_schedule"
-3. whitelist override — hit reason "whitelist", bypasses audience + traffic
+3. whitelist override — hit reason "whitelist", bypasses ring/audience gates
 4. audience gate      — miss reason "audience_mismatch" (with evaluated tree)
-5. variant bucket     — sha256(salt|version|experiment|user) bytes 0..7 % 10000
-6. traffic gate       — independent gate bucket (bytes 8..15); miss "not_in_traffic"
+5. variant bucket     — sha256(salt|version|experiment|user) % 10000
+6. namespace ring     — one shared gate position per namespace; miss reasons
+                        "mutex_excluded" (position belongs to another
+                        experiment) or "not_in_traffic" (unclaimed tail)
 7. variant assignment — reason "bucket"
 
-Both buckets are always computed (even for whitelist / misses) so the trace
-shows where the user *would* have landed. Whitelist decisions record the
-bucket that was overridden but assign the forced variant.
+The variant bucket and the namespace gate bucket are independent hashes.
+Whitelist decisions record the bucket that was overridden but assign the
+forced variant (a whitelisted user is deliberately forced into that
+experiment regardless of namespace allocation).
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
 from . import audience as audience_mod
+from . import mutex as mutex_mod
 from . import repository as repo
-from .hashing import BUCKET_SPACE
+from .hashing import BUCKET_SPACE, variant_bucket
+from .mutex import NamespaceRing
 from .repository import LoadedVersion
 from .schemas import TraceStep
 from .time_utils import utcnow, window_active
@@ -63,6 +69,30 @@ class Decision:
             "idempotency_key": idempotency_key,
             "exposure_recorded": exposure_recorded,
         }
+
+
+def stored_row_to_decision(row: dict[str, Any], idempotency_key: str,
+                           exposure_recorded: bool) -> dict[str, Any]:
+    """Serialize a persisted exposure row into the decision response shape.
+
+    Used for idempotent replays: the response must be the decision exactly
+    as first persisted (same version, variant, reason, trace), never a
+    freshly recomputed one that could disagree with the database.
+    """
+    return {
+        "experiment_key": row["experiment_key"],
+        "version_id": row["version_id"],
+        "version_number": row["version_number"],
+        "user_key": row["user_key"],
+        "bucket": row["bucket"],
+        "gate_bucket": row.get("gate_bucket"),
+        "enrolled": row["enrolled"],
+        "variant_key": row["variant_key"],
+        "reason": row["reason"],
+        "trace": row["trace"],
+        "idempotency_key": idempotency_key,
+        "exposure_recorded": exposure_recorded,
+    }
 
 
 def _schedule_active(loaded: LoadedVersion, at: datetime) -> tuple[bool, Any]:
@@ -118,15 +148,43 @@ def _variant_for_bucket(ranges: list[dict[str, Any]], bucket: int) -> dict[str, 
 def decide(experiment_key: str, user_key: str,
            attributes: dict[str, Any], *,
            version: Optional[int] = None,
-           at: Optional[datetime] = None) -> Decision:
-    at = (at or utcnow())
+           at: Optional[datetime] = None,
+           ring_cache: Optional[dict[str, Any]] = None) -> Decision:
+    at = at or utcnow()
     loaded = repo.get_published_version(experiment_key, version)
-    return decide_loaded(loaded, user_key, attributes, at=at)
+    ring = _resolve_ring(loaded, user_key, at, version is not None, ring_cache)
+    return decide_loaded(loaded, user_key, attributes, at=at, ring=ring)
+
+
+def _resolve_ring(loaded: LoadedVersion, user_key: str, at: datetime,
+                  pinned: bool,
+                  ring_cache: Optional[dict[str, Any]]) -> NamespaceRing:
+    """Build the namespace ring, honoring a batch cache and pinned versions.
+
+    A pinned (historical) version replaces that experiment's latest version
+    inside the ring, so the gate decision is made against the configuration
+    the caller explicitly asked for.
+    """
+    namespace = loaded.namespace
+    cache_key = (namespace, user_key, at.isoformat())
+    if ring_cache is not None and cache_key in ring_cache:
+        members = ring_cache[cache_key]
+    else:
+        members = repo.load_latest_published_in_namespace(namespace)
+        if ring_cache is not None:
+            ring_cache[cache_key] = members
+    if pinned:
+        members = [loaded if m.experiment_key == loaded.experiment_key else m
+                   for m in members]
+        if not any(m.experiment_key == loaded.experiment_key for m in members):
+            members = [*members, loaded]
+    return mutex_mod.build_ring(members, namespace, user_key, at)
 
 
 def decide_loaded(loaded: LoadedVersion, user_key: str,
                   attributes: dict[str, Any], *,
-                  at: Optional[datetime] = None) -> Decision:
+                  at: Optional[datetime] = None,
+                  ring: Optional[NamespaceRing] = None) -> Decision:
     at = at or utcnow()
     steps: list[TraceStep] = []
     steps.append(trace(
@@ -136,20 +194,16 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
         traffic_percentage=loaded.config.traffic_percentage,
     ))
 
-    # Both buckets depend only on salt|version|experiment|user, so they can
-    # be computed before every gate and are present on every decision trace.
-    from .hashing import gate_bucket as compute_gate_bucket
-    from .hashing import variant_bucket as compute_variant_bucket
-    bucket = compute_variant_bucket(loaded.experiment_key, loaded.salt,
-                                    loaded.version, user_key)
-    gate = compute_gate_bucket(loaded.experiment_key, loaded.salt,
-                               loaded.version, user_key)
+    # Variant bucket depends only on salt|version|experiment|user; it is
+    # always present, even on misses, to show where the user would land.
+    bucket = variant_bucket(loaded.experiment_key, loaded.salt,
+                            loaded.version, user_key)
     ranges = _variant_ranges(loaded)
     target = _variant_for_bucket(ranges, bucket)
     steps.append(trace("bucket", "computed", bucket=bucket,
-                       gate_bucket=gate, bucket_space=BUCKET_SPACE,
+                       bucket_space=BUCKET_SPACE,
                        formula=f"sha256('{loaded.salt}|{loaded.version}|"
-                               f"{loaded.experiment_key}|{user_key}')",
+                               f"{loaded.experiment_key}|{user_key}') % {BUCKET_SPACE}",
                        bucketed_variant=target["variant_key"],
                        ranges=ranges))
 
@@ -161,12 +215,12 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
         return Decision(
             experiment_key=loaded.experiment_key, version_id=loaded.id,
             version_number=loaded.version, user_key=user_key, bucket=bucket,
-            gate_bucket=gate, enrolled=False, variant_key=None,
+            gate_bucket=-1, enrolled=False, variant_key=None,
             reason="not_in_schedule", trace=steps)
     steps.append(trace("schedule", "active", at=at.isoformat(),
                        **(window_detail or {"always_on": True})))
 
-    # 3. whitelist override (bypasses audience and traffic gates)
+    # 3. whitelist override (bypasses audience and namespace-ring gates)
     forced = _whitelist_lookup(loaded, user_key)
     if forced is not None:
         steps.append(trace("whitelist", "matched",
@@ -175,7 +229,7 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
         return Decision(
             experiment_key=loaded.experiment_key, version_id=loaded.id,
             version_number=loaded.version, user_key=user_key, bucket=bucket,
-            gate_bucket=gate, enrolled=True, variant_key=forced,
+            gate_bucket=-1, enrolled=True, variant_key=forced,
             reason="whitelist", trace=steps)
     steps.append(trace("whitelist", "miss"))
 
@@ -188,25 +242,56 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
             return Decision(
                 experiment_key=loaded.experiment_key, version_id=loaded.id,
                 version_number=loaded.version, user_key=user_key, bucket=bucket,
-                gate_bucket=gate, enrolled=False, variant_key=None,
+                gate_bucket=-1, enrolled=False, variant_key=None,
                 reason="audience_mismatch", trace=steps)
         steps.append(trace("audience", "matched", tree=tree))
     else:
         steps.append(trace("audience", "skipped", reason="no_audience_defined"))
 
-    # 6. traffic gate (uses the independent gate bucket)
-    cutoff = round(loaded.config.traffic_percentage * BUCKET_SPACE / 100.0)
-    admitted = gate < cutoff
-    steps.append(trace("traffic", "admitted" if admitted else "rejected",
-                       traffic_percentage=loaded.config.traffic_percentage,
-                       cutoff=cutoff, gate_bucket=gate,
-                       variant_bucket=bucket))
-    if not admitted:
+    # 6. namespace mutex ring gate
+    if ring is None:
+        ring = _resolve_ring(loaded, user_key, at, False, None)
+    own_slice = ring.slice_of(loaded.experiment_key)
+    owner = ring.owner()
+    steps.append(trace("mutex_ring", "evaluated",
+                       namespace=ring.namespace,
+                       gate_bucket=ring.gate_bucket,
+                       gate_formula=f"sha256('ns|{ring.namespace}|{user_key}') "
+                                    f"% {BUCKET_SPACE}",
+                       slices=ring.describe()))
+    if own_slice is None:
+        # Inactive/zero-size slice while the user passed the schedule gate
+        # (can only happen with a pinned historical version).
+        steps.append(trace("traffic", "rejected",
+                           reason="no_slice_in_ring", gate_bucket=ring.gate_bucket))
         return Decision(
             experiment_key=loaded.experiment_key, version_id=loaded.id,
             version_number=loaded.version, user_key=user_key, bucket=bucket,
-            gate_bucket=gate, enrolled=False, variant_key=None,
+            gate_bucket=ring.gate_bucket, enrolled=False, variant_key=None,
             reason="not_in_traffic", trace=steps)
+    if owner is None or owner.experiment_key != loaded.experiment_key:
+        winner = None if owner is None else {
+            "experiment_key": owner.experiment_key,
+            "version_number": owner.version_number,
+            "slice": {"start": owner.start, "end": owner.end},
+        }
+        reason = "mutex_excluded" if owner is not None else "not_in_traffic"
+        steps.append(trace("traffic", "rejected",
+                           reason=reason, gate_bucket=ring.gate_bucket,
+                           own_slice={"start": own_slice.start,
+                                      "end": own_slice.end},
+                           winner=winner))
+        return Decision(
+            experiment_key=loaded.experiment_key, version_id=loaded.id,
+            version_number=loaded.version, user_key=user_key, bucket=bucket,
+            gate_bucket=ring.gate_bucket, enrolled=False, variant_key=None,
+            reason=reason, trace=steps)
+
+    steps.append(trace("traffic", "admitted",
+                       traffic_percentage=loaded.config.traffic_percentage,
+                       gate_bucket=ring.gate_bucket,
+                       own_slice={"start": own_slice.start,
+                                  "end": own_slice.end}))
 
     # 7. variant
     steps.append(trace("variant_assignment", "assigned",
@@ -215,8 +300,8 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
     return Decision(
         experiment_key=loaded.experiment_key, version_id=loaded.id,
         version_number=loaded.version, user_key=user_key, bucket=bucket,
-        gate_bucket=gate, enrolled=True, variant_key=target["variant_key"],
-        reason="bucket", trace=steps)
+        gate_bucket=ring.gate_bucket, enrolled=True,
+        variant_key=target["variant_key"], reason="bucket", trace=steps)
 
 
 # ---------------------------------------------------------------------------
@@ -234,18 +319,37 @@ def decide_and_record(experiment_key: str, user_key: str,
                       attributes: dict[str, Any], *,
                       version: Optional[int] = None,
                       at: Optional[datetime] = None,
-                      idempotency_key: Optional[str] = None) -> dict[str, Any]:
-    decision = decide(experiment_key, user_key, attributes,
-                      version=version, at=at)
+                      idempotency_key: Optional[str] = None,
+                      ring_cache: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    at = at or utcnow()
+    loaded = repo.get_published_version(experiment_key, version)
     key = idempotency_key or default_idempotency_key(
-        experiment_key, decision.version_number, user_key)
-    import json
+        experiment_key, loaded.version, user_key)
+
+    # Fast path: an existing record with this key is the authoritative first
+    # decision. Return it verbatim instead of recomputing (which could use a
+    # newer version and contradict the persisted row).
+    from .errors import NotFoundError
+    try:
+        existing = repo.get_exposure_by_key(key)
+    except NotFoundError:
+        existing = None
+    if existing is not None:
+        return stored_row_to_decision(existing, key, False)
+
+    ring = _resolve_ring(loaded, user_key, at, version is not None, ring_cache)
+    decision = decide_loaded(loaded, user_key, attributes, at=at, ring=ring)
     trace_payload = json.dumps(
         [t.model_dump() for t in decision.trace], ensure_ascii=False)
-    recorded, _row = repo.insert_exposure(
-        key, experiment_key, decision.version_id, decision.version_number,
-        user_key, decision.bucket, decision.gate_bucket,
-        decision.variant_key, decision.enrolled, decision.reason,
-        trace_payload,
-    )
-    return decision.to_dict(idempotency_key=key, exposure_recorded=recorded)
+    try:
+        recorded, row = repo.insert_exposure(
+            key, experiment_key, decision.version_id, decision.version_number,
+            user_key, decision.bucket, decision.gate_bucket,
+            decision.variant_key, decision.enrolled, decision.reason,
+            trace_payload,
+        )
+    except Exception:
+        # Race: another request inserted the same key concurrently.
+        row = repo.get_exposure_by_key(key)
+        return stored_row_to_decision(row, key, False)
+    return stored_row_to_decision(row, key, recorded)

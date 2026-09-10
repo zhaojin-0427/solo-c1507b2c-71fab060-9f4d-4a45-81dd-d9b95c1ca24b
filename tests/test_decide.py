@@ -23,7 +23,7 @@ def test_basic_enrollment_and_full_trace(client):
     assert body["reason"] == "bucket"
     steps = [s["step"] for s in body["trace"]]
     assert steps == ["version_resolved", "bucket", "schedule", "whitelist",
-                     "audience", "traffic", "variant_assignment"]
+                     "audience", "mutex_ring", "traffic", "variant_assignment"]
     bucket_step = next(s for s in body["trace"] if s["step"] == "bucket")
     assert 0 <= bucket_step["detail"]["bucket"] < 10000
     assert "formula" in bucket_step["detail"]

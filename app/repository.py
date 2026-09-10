@@ -185,15 +185,15 @@ def get_published_version(experiment_key: str,
 
 
 def latest_published_versions_in_namespace(namespace: str,
-                                           exclude_experiment: str
+                                           exclude_experiment: str | None = None
                                            ) -> list[dict[str, Any]]:
-    """Latest published version of every *other* experiment in a namespace.
+    """Latest published version of every experiment in a namespace.
 
     Used for publish-time mutex checks: per experiment only the newest
     published version counts, since older ones have been superseded.
+    Pass ``exclude_experiment`` to skip the experiment being published.
     """
-    rows = get_conn().execute(
-        """
+    sql = """
         SELECT v.experiment_key, v.version, v.namespace, v.traffic_percentage,
                v.config_json
         FROM experiment_versions v
@@ -201,14 +201,19 @@ def latest_published_versions_in_namespace(namespace: str,
             SELECT experiment_key, MAX(version) AS max_version
             FROM experiment_versions
             WHERE status = 'published' AND namespace = ?
-              AND experiment_key != ?
+            {exclude}
             GROUP BY experiment_key
         ) m ON m.experiment_key = v.experiment_key
            AND m.max_version = v.version
         WHERE v.status = 'published'
-        """,
-        (namespace, exclude_experiment),
-    ).fetchall()
+    """
+    params: list[Any] = [namespace]
+    if exclude_experiment is not None:
+        sql = sql.format(exclude="AND experiment_key != ?")
+        params.append(exclude_experiment)
+    else:
+        sql = sql.format(exclude="")
+    rows = get_conn().execute(sql, params).fetchall()
     return [{
         "experiment_key": r["experiment_key"],
         "version": r["version"],
@@ -216,6 +221,72 @@ def latest_published_versions_in_namespace(namespace: str,
         "traffic_percentage": r["traffic_percentage"],
         "config": json.loads(r["config_json"]),
     } for r in rows]
+
+
+def load_latest_published_in_namespace(namespace: str
+                                       ) -> list[LoadedVersion]:
+    """Loaded latest published versions for every experiment in a namespace.
+
+    Decision-time mutex ring: includes each experiment's salt so the ring
+    gate bucket is scoped to the namespace.
+    """
+    rows = get_conn().execute(
+        """
+        SELECT v.*, e.salt FROM experiment_versions v
+        JOIN experiments e ON e.key = v.experiment_key
+        JOIN (
+            SELECT experiment_key, MAX(version) AS max_version
+            FROM experiment_versions
+            WHERE status = 'published' AND namespace = ?
+            GROUP BY experiment_key
+        ) m ON m.experiment_key = v.experiment_key
+           AND m.max_version = v.version
+        WHERE v.status = 'published'
+        ORDER BY v.experiment_key
+        """,
+        (namespace,),
+    ).fetchall()
+    return [_row_to_version(r) for r in rows]
+
+
+def create_experiment_with_version(key: str, name: str, namespace: str,
+                                   salt: Optional[str],
+                                   config: VersionConfigIn,
+                                   status: str) -> tuple[dict[str, Any], LoadedVersion]:
+    """Atomically insert experiment + first version.
+
+    If the version insert fails (e.g. a DB-level constraint) the whole
+    transaction rolls back, so a rejected create never leaves orphan
+    experiment metadata behind and the same key can be retried.
+    """
+    effective_salt = salt or secrets.token_hex(16)
+    with transaction() as tx:
+        try:
+            cur = tx.execute(
+                "INSERT INTO experiments (key, name, namespace, salt, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (key, name, namespace, effective_salt, to_iso(utcnow())),
+            )
+        except Exception as exc:
+            if _is_unique(exc):
+                raise ConflictError("experiment_exists",
+                                    f"experiment {key!r} already exists")
+            raise
+        exp_id = cur.lastrowid
+        next_version = 1
+        published_at = to_iso(utcnow()) if status == "published" else None
+        tx.execute(
+            "INSERT INTO experiment_versions "
+            "(experiment_key, version, status, config_json, traffic_percentage, "
+            " namespace, created_at, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (key, next_version, status, _config_dump(config),
+             config.traffic_percentage, namespace,
+             to_iso(utcnow()), published_at),
+        )
+    exp = dict(get_conn().execute(
+        "SELECT * FROM experiments WHERE id = ?", (exp_id,)).fetchone())
+    return exp, get_version(key, next_version)
 
 
 def publish_version(experiment_key: str, version: int) -> LoadedVersion:

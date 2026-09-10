@@ -30,16 +30,13 @@ class WhitelistEntry(StrictModel):
 
 
 class ScheduleWindow(StrictModel):
+    # Note: start/end ordering is deliberately NOT enforced at the Pydantic
+    # layer — an inverted window must parse successfully so that /preflight
+    # can report it as a structured validation issue (code schedule_order)
+    # instead of failing request parsing. Timezone-awareness is likewise
+    # checked structurally (see validation.py).
     start_at: datetime
     end_at: datetime
-
-    @model_validator(mode="after")
-    def _check_window(self) -> "ScheduleWindow":
-        if self.start_at.tzinfo is None or self.end_at.tzinfo is None:
-            raise ValueError("start_at/end_at must be timezone aware")
-        if self.end_at <= self.start_at:
-            raise ValueError("end_at must be after start_at")
-        return self
 
 
 FieldOp = Literal[

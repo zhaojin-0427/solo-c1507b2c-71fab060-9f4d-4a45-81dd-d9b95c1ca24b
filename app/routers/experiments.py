@@ -73,18 +73,23 @@ def _reject_if_issues(issues: list[ValidationIssue], code: str = "invalid_config
              summary="Create an experiment (optionally with its first version)")
 def create_experiment(payload: ExperimentCreate) -> ExperimentOut:
     namespace = payload.namespace or payload.key
-    row = repo.create_experiment(payload.key, payload.name, namespace, payload.salt)
 
     if payload.config is not None:
+        # Validate BEFORE any row is inserted so a rejected create leaves no
+        # orphan experiment metadata and the same key can be retried.
         if payload.publish:
-            issues = services.run_preflight(payload.key, payload.config)
-            _reject_if_issues(issues)
-            status = "published"
+            issues = services.validate_candidate_for_namespace(
+                payload.key, namespace, payload.config)
         else:
             issues = validate_structure(payload.config)
-            _reject_if_issues(issues)
-            status = "draft"
-        repo.create_version(payload.key, payload.config, status)
+        _reject_if_issues(issues)
+        # Atomic experiment + first-version insert (rollback on failure).
+        repo.create_experiment_with_version(
+            payload.key, payload.name, namespace, payload.salt,
+            payload.config, "published" if payload.publish else "draft")
+    else:
+        repo.create_experiment(payload.key, payload.name, namespace,
+                               payload.salt)
 
     full = repo.list_experiments()
     return _experiment_out(next(e for e in full if e["key"] == payload.key))
@@ -142,10 +147,15 @@ def publish_version(experiment_key: str, version: int) -> VersionOut:
 
 
 @router.post("/{experiment_key}/preflight", response_model=PreflightResponse,
+             responses={422: {"model": PreflightResponse}},
              summary="Validate a candidate config without storing it")
 def preflight(experiment_key: str, payload: VersionConfigIn) -> PreflightResponse:
     issues = services.run_preflight(experiment_key, payload)
-    return PreflightResponse(valid=not issues, issues=issues)
+    response = PreflightResponse(valid=not issues, issues=issues)
+    if issues:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=422, content=response.model_dump())
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -184,20 +194,26 @@ def decide(experiment_key: str, payload: DecideRequest) -> DecisionResponse:
              summary="Decide one user across up to 500 experiments")
 def decide_batch(payload: BatchDecideRequest) -> BatchDecideResponse:
     items: list[BatchItem] = []
+    # One shared ring cache per (namespace, user, at) keeps every decision
+    # in the same batch mutually consistent with the namespace mutex rule.
+    ring_cache: dict = {}
+    at = payload.at
     for key in payload.experiment_keys:
         try:
             if payload.record_exposure:
                 result = engine.decide_and_record(
                     key, payload.user_key, payload.attributes,
-                    version=payload.version, at=payload.at,
+                    version=payload.version, at=at,
                     idempotency_key=(
                         f"{payload.idempotency_key}:{key}"
                         if payload.idempotency_key else None),
+                    ring_cache=ring_cache,
                 )
             else:
                 result = engine.decide(
                     key, payload.user_key, payload.attributes,
-                    version=payload.version, at=payload.at,
+                    version=payload.version, at=at,
+                    ring_cache=ring_cache,
                 ).to_dict()
             items.append(BatchItem(experiment_key=key,
                                    decision=DecisionResponse.model_validate(result)))

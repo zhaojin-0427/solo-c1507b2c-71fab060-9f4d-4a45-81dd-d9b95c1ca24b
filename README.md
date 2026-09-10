@@ -83,15 +83,16 @@ curl -s -X POST $API/experiments/checkout_redesign/decide \
 ### 稳定哈希分桶
 
 ```
-digest = sha256("salt | version_number | experiment_key | user_key")
-variant_bucket = int(digest[0:8])  % 10000   # 选择变体区间
-gate_bucket    = int(digest[8:16]) % 10000   # 独立的流量门桶
+variant_bucket = sha256("salt | version_number | experiment_key | user_key")[0:8]  % 10000
+gate_position  = sha256("ns | namespace | user_key")[0:8] % 10000        # 命名空间共享门位置
 ```
 
-- **版本不变 + 用户不变 ⇒ 分桶永远不变**（同版本重复决策结果固定）。
-- 每个实验拥有独立随机盐（创建时自动生成，也可显式传入），避免不同实验间用户分桶相关性。
-- 版本号参与哈希：发布新版本是一次有意的重新洗牌。
-- 变体桶与流量门桶取自摘要的不同字节，互不相关——因此 50% 总流量 + 50/50 变体时，
+- **版本不变 + 用户不变 ⇒ 变体分桶永远不变**（同版本重复决策结果固定）。
+- 每个实验拥有独立随机盐（创建时自动生成，也可显式传入），避免不同实验间变体分桶相关性。
+- 版本号参与变体哈希：发布新版本是一次有意的重新洗牌。
+- **门位置按命名空间共享**：同一命名空间内所有实验对同一用户看到同一个 `gate_position`，
+  配合下文的“命名空间环”保证一个用户在同一时刻至多进入命名空间内的一个实验。
+- 变体桶与流量门位置是两条独立哈希，互不相关——因此 50% 总流量 + 50/50 变体时，
   命中的一半用户仍均匀落在两个变体，而不会塌缩到首个区间。
 
 ### 决策流水线（每一步都进入 trace）
@@ -100,10 +101,10 @@ gate_bucket    = int(digest[8:16]) % 10000   # 独立的流量门桶
 |---|---|---|---|
 | 1 | `version_resolved` | — | 解析版本（最新发布或指定版本），记录 salt/namespace |
 | 2 | `schedule` | `not_in_schedule` | 半开区间 `[start, end)`；无 schedules 表示全时生效 |
-| 3 | `whitelist` | — | 命中即**强制分流**，绕过受众与流量门，reason=`whitelist` |
+| 3 | `whitelist` | — | 命中即**强制分流**，绕过受众与命名空间门，reason=`whitelist` |
 | 4 | `audience` | `audience_mismatch` | 嵌套 AND/OR/NOT 条件树，trace 内含完整求值树与实际属性值 |
-| 5 | `bucket` | — | 计算 variant / gate 双桶及各变体区间 |
-| 6 | `traffic` | `not_in_traffic` | `gate_bucket < traffic_percentage * 100` |
+| 5 | `bucket` | — | 计算变体桶及各变体区间 |
+| 6 | `mutex_ring` + `traffic` | `mutex_excluded` / `not_in_traffic` | 命名空间环门（见下）；`mutex_excluded` 时 trace 给出胜出实验 |
 | 7 | `variant_assignment` | — | reason=`bucket`，变体区间按 key 排序、末段吸收取整误差 |
 
 受众操作符：`eq, ne, in, nin, gt, gte, lt, lte, contains, not_contains,
@@ -111,13 +112,24 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 
 ### 互斥命名空间与生效时段
 
+互斥在**发布**和**分流**两个层面同时强制执行：
+
+- **发布时（容量上限）**：系统取命名空间内其他每个实验的最新发布版本，用扫描线沿时间轴
+  计算任意时刻**所有**同时生效实验的流量占用总和；任一时刻总和 > 100% 即拒绝
+  （`422 namespace_traffic_conflict`，错误信息给出峰值占用，因此三个各占 40% 的时间重叠
+  实验即使两两之和都不超过 80% 也无法全部发布）。无 schedules 视为“永远在线”，即与一切
+  时间窗相交；非重叠时间窗允许各自吃满 100%。
+- **分流时（命名空间环，真正互斥）**：同一时刻命名空间内所有生效实验按实验 key 排序，
+  在 `[0,10000)` 环上依次领取不重叠的连续切片（大小 = `traffic_percentage`），
+  用户在环上的位置由命名空间共享哈希 `sha256(ns|namespace|user)` 决定。
+  一个用户只有一个环位置，因此**至多落入一个实验的切片**：
+  落入其他实验切片 → `mutex_excluded`（trace 的 `winner` 标明被哪个实验拿走）；
+  落入无人认领的尾部 → `not_in_traffic`。环的构成只由已发布配置集合决定，
+  发布/下线/时间窗切换才会引起流量重分配，单用户决策保持确定性。
 - 每个实验属于一个 `namespace`（缺省为自身 key，即默认互不干扰）。
-- 发布 / 预检时，系统取命名空间内**其他每个实验的最新发布版本**做冲突校验：
-  两边生效时间重叠（无 schedules 视为“永远在线”，即与一切相交）
-  且 `traffic_percentage` 之和 **> 100%** 时拒绝（`422 namespace_traffic_conflict`）。
-  非重叠时间窗允许各自吃满 100%。
+- 白名单是显式强制覆盖，绕过环门（可理解为运维强制注入，不受互斥约束）。
 - 同一实验的版本采用“最新发布生效”模型：发布新版本即接管流量，旧版本保留为不可变历史，
-  可通过 `version` 参数回放。
+  可通过 `version` 参数回放（环中该实验的切片会替换为被固定的历史版本）。
 
 ### 校验规则（预检与发布时全部返回结构化 issues）
 
@@ -125,13 +137,16 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 - 恰好一个 `is_control`，且 `control_variant_key` 必须指向已声明变体。
 - 白名单用户不可重复，目标变体必须存在。
 - 受众 `in/nin` 的 value 必须为列表；比较操作符必须提供 value。
-- 时间窗必须带时区、end > start；同一配置内时间窗不得重叠（`schedule_overlap`）。
-- 命名空间互斥冲突（见上）。
+- 时间窗必须带时区、end > start；同一配置内时间窗不得重叠（`schedule_overlap`）。非法时间窗
+  在预检中返回 **422 结构化 issues**（`schedule_order` / `schedule_timezone`），而不是请求解析错误或 500。
+- 命名空间互斥冲突（任意时间点总占用 > 100%，见上）。
+- 创建实验若校验失败，**不会留下任何实验元数据**（实验行与版本行在同一事务内），同一实验键可立即修正后重试。
 
 ### 曝光：幂等、汇总、版本可追溯
 
-- `decide` 携带 `record_exposure=true` 时落库；`idempotency_key` 相同则返回原始记录
-  （`exposure_recorded=false` 表示去重命中，响应中的版本/变体即首次决策的结果）。
+- `decide` 携带 `record_exposure=true` 时落库；`idempotency_key` 相同则**直接返回首次持久化的
+  原始决策**（`exposure_recorded=false` 表示去重命中）——即使此后发布了新版本、或重放请求携带
+  不同属性，响应也与数据库中首次记录的版本/变体/reason/trace 完全一致，不会重新计算出相互矛盾的结果。
   未显式提供幂等键时使用 `sha256(experiment|version|user)` 作为天然去重键。
 - **未分流决策也记录**（带 reason），便于漏斗分析。
 - `GET /experiments/{key}/exposures/summary` 按变体计数、按 reason 计数，可加 `?version=N`
@@ -149,7 +164,7 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 | GET | `/api/experiments/{key}/versions` | 全部版本历史 |
 | GET | `/api/experiments/{key}/versions/{v}` | 单个版本（不可变快照） |
 | POST | `/api/experiments/{key}/versions/{v}/publish` | 草稿经互斥校验后发布 |
-| POST | `/api/experiments/{key}/preflight` | **只校验不入库**，返回 issues 列表 |
+| POST | `/api/experiments/{key}/preflight` | **只校验不入库**；合法返回 200 `{valid:true}`，非法返回 422 结构化 issues |
 | POST | `/api/experiments/{key}/decide` | 单个分流（可记录曝光、固定版本、指定时间） |
 | POST | `/api/experiments/decide/batch` | 一个用户跨 ≤500 个实验批量分流，单项错误隔离 |
 | POST | `/api/experiments/{key}/simulate?version=` | 蒙特卡洛模拟分布（不落曝光），返回配置占比 vs 实际占比、未命中原因分布 |

@@ -6,15 +6,16 @@ Two layers:
   percentages sum to 100, exactly one control, whitelist targets existing
   variants, schedule windows well-formed and non-overlapping.
 * ``validate_publish`` — additionally checks the mutex-namespace rule
-  against stored state: for every *other* experiment in the namespace, its
-  latest published version and the candidate must not have overlapping
-  active time while their traffic percentages sum beyond 100%.
+  against stored state: the candidate must not, at any point in time, push
+  the *total* namespace traffic above 100%. Overlaps are checked against
+  every other experiment's latest published version via a sweep over the
+  schedule timeline, so three experiments at 40% each are rejected even
+  though no single pair exceeds 100%. An always-on version (no schedules)
+  is active over the whole timeline.
 
 Versions of the same experiment are immutable history; at decision time the
 latest published version wins (unless the caller pins one), so publishing a
-new version supersedes older ones rather than conflicting with them. An
-always-on version (no schedules) is treated as active over the whole
-timeline and therefore intersects every window.
+new version supersedes older ones rather than conflicting with them.
 """
 
 from __future__ import annotations
@@ -133,6 +134,11 @@ def _validate_schedules(windows: list[ScheduleWindow]) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     parsed: list[tuple[datetime, datetime]] = []
     for i, w in enumerate(windows):
+        if w.start_at.tzinfo is None or w.end_at.tzinfo is None:
+            issues.append(_issue("schedule_timezone",
+                                 "schedule timestamps must be timezone aware",
+                                 f"schedules[{i}]"))
+            continue
         if w.end_at <= w.start_at:
             issues.append(_issue("schedule_order",
                                  "schedule end_at must be after start_at",
@@ -155,12 +161,81 @@ def _validate_schedules(windows: list[ScheduleWindow]) -> list[ValidationIssue]:
 # ---------------------------------------------------------------------------
 
 
+def _candidate_windows(config: VersionConfigIn) -> list[tuple[datetime, datetime]] | None:
+    """None means 'always on'; otherwise the explicit half-open windows."""
+    windows = [(w.start_at, w.end_at) for w in config.schedules]
+    return windows or None
+
+
+def _other_windows(row: dict[str, Any]) -> list[tuple[datetime, datetime]] | None:
+    raw = row["config"].get("schedules", [])
+    if not raw:
+        return None
+    return [(parse_iso(w["start_at"]), parse_iso(w["end_at"])) for w in raw]
+
+
+def _peak_concurrent(base_traffic: float,
+                     others: list[tuple[float, list[tuple[datetime, datetime]] | None]],
+                     clip: tuple[datetime, datetime] | None = None) -> float:
+    """Peak total traffic on a timeline.
+
+    ``base_traffic`` is always-on traffic (e.g. an always-on candidate).
+    Each other entry is (traffic_percentage, windows); None windows mean the
+    entry is always on. ``clip`` restricts the sweep to one window.
+    """
+    # Always-on competitors contribute everywhere.
+    always_on = sum(t for t, w in others if w is None)
+    bounded = [(t, w) for t, w in others if w is not None]
+
+    if clip is None:
+        # Candidate is always on: the peak is the highest simultaneous
+        # concurrency among bounded competitors over the whole timeline.
+        events: list[tuple[datetime, int, float]] = []
+        for traffic, windows in bounded:
+            for s, e in windows:
+                events.append((s, 1, traffic))   # start applies at t
+                events.append((e, 0, traffic))   # end releases first (half-open)
+        if not events:
+            return base_traffic + always_on
+        events.sort(key=lambda ev: (ev[0], ev[1]))
+        current = 0.0
+        peak = 0.0
+        for _, kind, traffic in events:
+            current += traffic if kind == 1 else -traffic
+            peak = max(peak, current)
+        return base_traffic + always_on + peak
+
+    # Candidate is active only inside [clip_s, clip_e): clip every
+    # competitor window to the candidate window and sweep that range.
+    c_start, c_end = clip
+    events = [(c_start, 1, 0.0), (c_end, 0, 0.0)]
+    for traffic, windows in bounded:
+        for s, e in windows:
+            s = max(s, c_start)
+            e = min(e, c_end)
+            if s < e:
+                events.append((s, 1, traffic))
+                events.append((e, 0, traffic))
+    events.sort(key=lambda ev: (ev[0], ev[1]))
+    current = 0.0
+    peak = 0.0
+    for _, kind, traffic in events:
+        current += traffic if kind == 1 else -traffic
+        peak = max(peak, current)
+    return base_traffic + always_on + peak
+
+
 def validate_publish(config: VersionConfigIn, namespace: str,
                      other_versions: list[dict[str, Any]]) -> list[ValidationIssue]:
     """Check mutex-namespace conflicts against stored state.
 
+    The namespace rule: at *no* point in time may the active experiments of
+    one namespace direct more than 100% of traffic in total. This is a
+    total-occupancy check (not pairwise), so three overlapping experiments
+    at 40% each are rejected.
+
     Each item of ``other_versions`` is the *latest published* version of one
-    *other* experiment in the same namespace, with keys:
+    *other* experiment in the namespace, with keys:
     ``experiment_key``, ``version``, ``namespace``, ``traffic_percentage``,
     ``config`` (decoded dict).
     """
@@ -168,35 +243,35 @@ def validate_publish(config: VersionConfigIn, namespace: str,
     if issues:
         return issues
 
-    new_windows = [(w.start_at, w.end_at) for w in config.schedules]
+    same_ns = [r for r in other_versions if r["namespace"] == namespace]
+    others = [(r["traffic_percentage"], _other_windows(r)) for r in same_ns]
 
-    for row in other_versions:
-        other_windows = [
-            (parse_iso(w["start_at"]), parse_iso(w["end_at"]))
-            for w in row["config"].get("schedules", [])
-        ]
-        if namespace != row["namespace"] or not _windows_intersect(new_windows, other_windows):
-            continue
-        combined = config.traffic_percentage + row["traffic_percentage"]
-        if combined > 100.0 + PERCENTAGE_TOLERANCE:
+    new_windows = _candidate_windows(config)
+    if new_windows is None:
+        peak = _peak_concurrent(config.traffic_percentage, others)
+        if peak > 100.0 + PERCENTAGE_TOLERANCE:
             issues.append(_issue(
                 "namespace_traffic_conflict",
-                (f"namespace {namespace!r}: overlapping schedule with experiment "
-                 f"{row['experiment_key']!r} v{row['version']} would direct "
-                 f"{config.traffic_percentage:g}% + {row['traffic_percentage']:g}% "
-                 f"= {combined:g}% of traffic (limit 100%)"),
+                (f"namespace {namespace!r}: publishing this always-on "
+                 f"{config.traffic_percentage:g}% version would reach "
+                 f"{peak:g}% total namespace traffic at peak (limit 100%)"),
+                "traffic_percentage",
+            ))
+        return issues
+
+    for s, e in new_windows:
+        peak = _peak_concurrent(config.traffic_percentage, others, clip=(s, e))
+        if peak > 100.0 + PERCENTAGE_TOLERANCE:
+            active = sorted(
+                f"{r['experiment_key']!r} v{r['version']} @ {r['traffic_percentage']:g}%"
+                for r, (_t, w) in zip(same_ns, others)
+                if w is None or any(not (e <= ws or s >= we) for ws, we in w))
+            issues.append(_issue(
+                "namespace_traffic_conflict",
+                (f"namespace {namespace!r}: schedule window "
+                 f"[{s.isoformat()}, {e.isoformat()}) would reach "
+                 f"{peak:g}% total namespace traffic at peak (limit 100%); "
+                 f"concurrent experiments: {', '.join(active) or 'n/a'}"),
                 "traffic_percentage",
             ))
     return issues
-
-
-def _windows_intersect(a: list[tuple[datetime, datetime]],
-                       b: list[tuple[datetime, datetime]]) -> bool:
-    """True when two schedule sets overlap in time.
-
-    An empty list means "always on" (active for the whole timeline), so an
-    always-on version intersects everything.
-    """
-    if not a or not b:
-        return True
-    return any(windows_overlap(s1, e1, s2, e2) for s1, e1 in a for s2, e2 in b)
