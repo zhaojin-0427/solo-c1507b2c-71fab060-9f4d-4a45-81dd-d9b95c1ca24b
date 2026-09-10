@@ -231,16 +231,30 @@ def decide_loaded(loaded: LoadedVersion, user_key: str,
                            user_key=user_key, forced_variant=forced,
                            bucketed_variant=target["variant_key"]))
         if continuity_info is not None:
-            # The forced variant overrides organic assignment; annotate the
-            # already-recorded continuity step rather than recomputing it.
-            continuity_info = {**continuity_info,
-                               "whitelist_forced_variant": forced,
-                               "change_reason": "whitelist_override"}
+            # The whitelist overrides organic assignment. Report the group
+            # switch truthfully: compared with the source group (after
+            # renames), forcing a different variant is a switched decision
+            # with reason whitelist_override; forcing the same group leaves
+            # the underlying continuity status intact.
+            organic_group = continuity_info["source_variant_after_rename"]
+            if forced != organic_group:
+                continuity_info = {
+                    **continuity_info,
+                    "variant_key": forced,
+                    "status": "switched",
+                    "change_reason": "whitelist_override",
+                    "whitelist_forced_variant": forced,
+                }
+            else:
+                continuity_info = {
+                    **continuity_info,
+                    "whitelist_forced_variant": forced,
+                }
             for i, step in enumerate(steps):
                 if step.step == "continuity":
-                    steps[i] = trace("continuity",
-                                     "retained" if continuity_info["status"] == "retained"
-                                     else "switched", **continuity_info)
+                    steps[i] = trace(
+                        "continuity", continuity_info["status"],
+                        **continuity_info)
                     break
         return Decision(
             experiment_key=loaded.experiment_key, version_id=loaded.id,

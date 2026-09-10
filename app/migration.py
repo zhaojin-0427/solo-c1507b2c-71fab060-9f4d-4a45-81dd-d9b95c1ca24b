@@ -64,6 +64,13 @@ def preview_migration(experiment_key: str, from_version: int, to_version: int,
     switch_reasons: dict[str, int] = {}
     samples: dict[str, list[dict[str, Any]]] = {k: [] for k in counts}
 
+    # Compose the FULL rename map across every continuity hop between the
+    # two explicit versions; a single frozen hop (v3's c->d after v2's
+    # b->c) is not enough when the preview skips versions.
+    renames = continuity_mod.compose_rename_chain(
+        from_version, to_version,
+        lambda v: repo.get_version(experiment_key, v))
+
     for item in users:
         user_key = item.user_key
         attrs = item.attributes
@@ -73,18 +80,24 @@ def preview_migration(experiment_key: str, from_version: int, to_version: int,
         d_new = engine.decide_loaded(new, user_key, attrs, at=at, ring=ring_new)
 
         category = continuity_mod.migration_status(
-            new.continuity, d_old.variant_key, d_new.variant_key,
+            renames, d_old.variant_key, d_new.variant_key,
             d_old.enrolled, d_new.enrolled)
         counts[category] += 1
 
         change_reason: Optional[str] = None
         if category == "switched":
-            if new.continuity and new.continuity.get("mode") == "inherit":
+            if d_new.reason == "whitelist":
+                # The target version's whitelist forced the move; this
+                # takes precedence over the organic boundary/set/reshuffle
+                # explanation even when the two versions are not connected
+                # by a continuity chain.
+                change_reason = "whitelist_override"
+            elif renames is not None:
                 # Explain the move relative to the EXPLICIT from_version,
-                # which may differ from the target's frozen chain anchor.
+                # using the composed rename map across the whole chain.
                 change_reason = continuity_mod.switch_reason_between(
                     old, new, d_old.variant_key, d_new.variant_key,
-                    user_key)
+                    user_key, renames=renames)
             else:
                 change_reason = SWITCH_REASON_RESHUFFLE
             switch_reasons[change_reason] = \

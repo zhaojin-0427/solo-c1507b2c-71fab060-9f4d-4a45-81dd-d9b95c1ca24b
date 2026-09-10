@@ -120,7 +120,15 @@ def resolve_continuity(experiment_key: str, target_version: Optional[int],
     if issues:
         return None, issues
 
-    source_keys = [v.key for v in source.config.variants]
+    # The source anchor order must be the order the source version actually
+    # used for bucketing (its frozen continuity order when it itself
+    # inherited, otherwise sorted key order) — NOT the declared payload
+    # order, which never participates in range layout. Using declaration
+    # order here would put every bucket into a different range while the
+    # trace still rebuilt source ranges in yet another order and reported a
+    # false "retained".
+    source_params = effective_assignment(source)
+    source_keys = list(source_params.variant_order)
     target_keys = [v.key for v in config.variants]
     source_set, target_set = set(source_keys), set(target_keys)
 
@@ -363,20 +371,71 @@ def evaluate_continuity(block: dict[str, Any],
     }
 
 
-def migration_status(block: Optional[dict[str, Any]],
+def compose_rename_chain(from_version: int, to_version: int,
+                         get_version: Any) -> Optional[dict[str, str]]:
+    """Compose the full rename map from ``from_version`` to ``to_version``.
+
+    Each continuity version freezes only the *single-hop* rename map its
+    caller declared; a v3 that renamed ``c -> d`` inheriting v2 (which had
+    renamed ``b -> c``) stores only ``{"c": "d"}``. Comparing v1 with v3
+    therefore requires walking the anchor chain and composing every hop:
+    the result maps ``b -> d`` (as well as ``a -> a``, ``c -> d``).
+
+    Returns None when the versions are not connected by inherit hops (the
+    target reshuffled, or the anchor chain does not reach from_version).
+    """
+    if from_version == to_version:
+        return {}
+    hops: list[tuple[int, dict[str, str]]] = []
+    cursor = to_version
+    seen: set[int] = set()
+    while cursor > from_version and cursor not in seen:
+        seen.add(cursor)
+        loaded = get_version(cursor)
+        block = getattr(loaded, "continuity", None)
+        if block is None or block.get("mode") != "inherit":
+            return None
+        anchor = block["source_version"]
+        hops.append((anchor, dict(block.get("renames") or {})))
+        cursor = anchor
+    if cursor != from_version:
+        return None
+
+    # hops are collected to-first-last walking back: compose in reverse so
+    # later renames apply on top of earlier ones.
+    composed: dict[str, str] = {}
+    for _, hop in reversed(hops):
+        if not composed:
+            composed = dict(hop)
+            continue
+        merged: dict[str, str] = {}
+        keys = set(composed) | set(hop)
+        for k in keys:
+            after_earlier = composed.get(k, k)
+            merged[k] = hop.get(after_earlier, after_earlier)
+        composed = merged
+    return composed
+
+
+def migration_status(renames: Optional[dict[str, str]],
                      from_variant: Optional[str],
                      to_variant: Optional[str],
                      from_enrolled: bool, to_enrolled: bool) -> str:
-    """Classify one user across two published versions for the preview."""
+    """Classify one user across two published versions for the preview.
+
+    ``renames`` is the *composed* rename map between the two explicit
+    versions (see :func:`compose_rename_chain`); None means the versions are
+    not connected by a continuity chain, so any variant difference is a
+    reshuffle.
+    """
     if not from_enrolled and to_enrolled:
         return "entered"
     if from_enrolled and not to_enrolled:
         return "exited"
     if not from_enrolled and not to_enrolled:
         return "not_enrolled"
-    if not block or block.get("mode") != "inherit":
+    if renames is None:
         return "retained" if from_variant == to_variant else "switched"
-    renames = block.get("renames", {})
     if to_variant == renames.get(from_variant, from_variant):
         return "retained"
     return "switched"
@@ -384,17 +443,18 @@ def migration_status(block: Optional[dict[str, Any]],
 
 def switch_reason_between(from_loaded: Any, to_loaded: Any,
                           from_variant: str, to_variant: str,
-                          user_key: str) -> str:
+                          user_key: str,
+                          renames: Optional[dict[str, str]] = None) -> str:
     """Explain why one enrolled user changed variant between two versions.
 
     Unlike the decision trace (which compares against the frozen anchor of
     the target version's continuity chain), this compares the two versions
-    the caller explicitly named in a migration preview.
+    the caller explicitly named in a migration preview; ``renames`` is the
+    composed rename map over every hop between them.
     """
     block = getattr(to_loaded, "continuity", None)
-    if block is None or block.get("mode") != "inherit":
+    if renames is None:
         return "reshuffled"
-    renames = block.get("renames", {})
     if to_variant == renames.get(from_variant, from_variant):
         return "retained"
 

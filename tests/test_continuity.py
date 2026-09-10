@@ -449,11 +449,11 @@ def test_idempotent_replay_unchanged_after_continuity_version(client):
 # ---------------------------------------------------------------------------
 
 
-def _preview(client, frm: int, to: int, users, **over):
+def _preview(client, frm: int, to: int, users, *, key: str = "exp", **over):
     payload = {"from_version": frm, "to_version": to, "users": users}
     payload.update(over)
     return client.post(
-        "/api/experiments/exp/versions/migration-preview", json=payload)
+        f"/api/experiments/{key}/versions/migration-preview", json=payload)
 
 
 def test_migration_preview_classifies_entered_retained_not_enrolled(client):
@@ -550,3 +550,178 @@ def test_migration_preview_is_deterministic(client):
     b2 = _preview(client, 1, 2, users).json()
     assert b1["counts"] == b2["counts"]
     assert b1["samples"] == b2["samples"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the four reviewed defects
+# ---------------------------------------------------------------------------
+
+
+def test_regression_non_lexicographic_source_order_keeps_groups(client):
+    """Same config inherited from a source whose DECLARED order is not the
+    lexicographic bucketing order must keep every user in the original
+    group, and the trace must agree (not falsely report retained/switched).
+    """
+    variants = [
+        {"key": "zeta", "percentage": 40, "is_control": True},
+        {"key": "alpha", "percentage": 30},
+        {"key": "mid", "percentage": 30},
+    ]
+    cfg = base_config(traffic=100, variants=variants,
+                      control_variant_key="zeta")
+    create_experiment(client, key="nlo", namespace="nlo", config=cfg)
+
+    users = [f"u-{i}" for i in range(120)]
+
+    def dec(user, version):
+        return client.post(f"/api/experiments/nlo/decide",
+                           json={"user_key": user, "version": version}).json()
+
+    v1 = {u: dec(u, 1) for u in users}
+
+    inherited = base_config(traffic=100, variants=[dict(v) for v in variants],
+                            control_variant_key="zeta")
+    inherited["continuity"] = {"mode": "inherit", "source_version": 1}
+    r = client.post("/api/experiments/nlo/versions",
+                    params={"publish": "true"}, json=inherited)
+    assert r.status_code == 201, r.text
+    # frozen effective order must equal the source's real bucketing order
+    # (lexicographic), regardless of declaration order
+    assert r.json()["continuity"]["variant_order"] == ["alpha", "mid", "zeta"]
+
+    kept = 0
+    for u in users:
+        d2 = dec(u, 2)
+        step = cont_step(d2)
+        assert d2["variant_key"] == v1[u]["variant_key"]
+        assert d2["bucket"] == v1[u]["bucket"]
+        assert step["result"] == "retained"
+        assert step["detail"]["change_reason"] == "same_variant"
+        kept += 1
+    assert kept == len(users)
+
+
+def test_regression_whitelist_force_switch_is_explained(client):
+    create_experiment(client, key="wl", namespace="wl",
+                      config=base_config(traffic=100))
+
+    def dec(user, version):
+        return client.post(f"/api/experiments/wl/decide",
+                           json={"user_key": user, "version": version}).json()
+
+    # Find a user whose organic group is control, then force to treatment.
+    forced_user = next(u for i in range(200)
+                       for u in [f"w-{i}"]
+                       if dec(u, 1)["variant_key"] == "control")
+    cfg = base_config(traffic=100, whitelist=[
+        {"user_key": forced_user, "variant_key": "treatment"}])
+    cfg["continuity"] = {"mode": "inherit", "source_version": 1}
+    r = client.post("/api/experiments/wl/versions",
+                    params={"publish": "true"}, json=cfg)
+    assert r.status_code == 201, r.text
+
+    d = dec(forced_user, 2)
+    assert d["enrolled"] is True and d["variant_key"] == "treatment"
+    assert d["reason"] == "whitelist"
+    step = cont_step(d)
+    assert step["result"] == "switched"
+    detail = step["detail"]
+    assert detail["change_reason"] == "whitelist_override"
+    assert detail["whitelist_forced_variant"] == "treatment"
+    assert detail["source_variant"] == "control"
+
+    # Migration preview must attribute the switch to the whitelist as well.
+    body = _preview(client, 1, 2, [{"user_key": forced_user}],
+                    key="wl").json()
+    assert body["counts"]["switched"] == 1
+    assert body["switch_reasons"] == {"whitelist_override": 1}
+    sample = body["samples"]["switched"][0]
+    assert sample["change_reason"] == "whitelist_override"
+    assert sample["to_reason"] == "whitelist"
+
+
+def test_regression_whitelist_same_group_stays_retained(client):
+    create_experiment(client, key="wl2", namespace="wl2",
+                      config=base_config(traffic=100))
+
+    def dec(user, version):
+        return client.post(f"/api/experiments/wl2/decide",
+                           json={"user_key": user, "version": version}).json()
+
+    same_group_user = next(u for i in range(200)
+                           for u in [f"w-{i}"]
+                           if dec(u, 1)["variant_key"] == "treatment")
+    cfg = base_config(traffic=100, whitelist=[
+        {"user_key": same_group_user, "variant_key": "treatment"}])
+    cfg["continuity"] = {"mode": "inherit", "source_version": 1}
+    client.post("/api/experiments/wl2/versions",
+                params={"publish": "true"}, json=cfg)
+    step = cont_step(dec(same_group_user, 2))
+    assert step["result"] == "retained"
+    assert step["detail"]["whitelist_forced_variant"] == "treatment"
+
+
+def test_regression_three_version_rename_chain_in_preview(client):
+    # v1: a/b ; v2 renames b -> c ; v3 renames c -> d. A v1 -> v3 preview
+    # must compose the full chain (b -> d) and count users retained.
+    create_experiment(client, key="rn", namespace="rn",
+                      config=base_config(traffic=100, control_variant_key="a",
+                                         variants=[
+                                             {"key": "a", "percentage": 50,
+                                              "is_control": True},
+                                             {"key": "b", "percentage": 50}]))
+    for new_key, renamed_from, anchor in (("c", "b", 1), ("d", "c", 2)):
+        cfg = base_config(traffic=100, control_variant_key="a", variants=[
+            {"key": "a", "percentage": 50, "is_control": True},
+            {"key": new_key, "percentage": 50},
+        ])
+        cfg["continuity"] = {
+            "mode": "inherit",
+            "source_version": anchor,
+            "renames": [{"source": renamed_from, "target": new_key}],
+        }
+        r = client.post("/api/experiments/rn/versions",
+                        params={"publish": "true"}, json=cfg)
+        assert r.status_code == 201, r.text
+
+    users = [{"user_key": f"x-{i}"} for i in range(100)]
+    body = _preview(client, 1, 3, users, key="rn").json()
+    assert body["counts"]["retained"] == 100
+    assert body["counts"]["switched"] == 0
+    assert body["switch_reasons"] == {}
+
+    # Every b user from v1 must land on d in v3 (spot check via pinned
+    # decisions), and the v3 trace still compares against its direct
+    # anchor v2 (single-hop c -> d).
+    def dec(user, version):
+        return client.post(f"/api/experiments/rn/decide",
+                           json={"user_key": user, "version": version}).json()
+
+    b_users = [f"x-{i}" for i in range(100)
+               if dec(f"x-{i}", 1)["variant_key"] == "b"]
+    assert b_users  # sanity: at least one b user
+    for u in b_users:
+        assert dec(u, 3)["variant_key"] == "d"
+        step = cont_step(dec(u, 3))
+        assert step["detail"]["source_version"] == 2
+        assert step["detail"]["change_reason"] == "renamed_variant"
+
+
+def test_regression_published_version_cannot_be_demoted_to_draft(client):
+    create_experiment(client, config=base_config())
+    conn = get_conn()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE experiment_versions SET status = 'draft' WHERE version = 1")
+    conn.rollback()
+    row = conn.execute(
+        "SELECT status FROM experiment_versions WHERE version = 1"
+    ).fetchone()
+    assert row[0] == "published"
+
+    # The demote attempt must not have opened a window to rewrite the
+    # frozen continuity block either.
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE experiment_versions SET continuity_json = '{}' WHERE version = 1")
+    conn.rollback()

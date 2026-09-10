@@ -203,6 +203,16 @@ WHEN OLD.status = 'published' AND NEW.status = 'published'
 BEGIN
     SELECT RAISE(ABORT, 'published version cannot be republished');
 END;
+
+-- A published version may never be demoted back to draft: that would reopen
+-- an immutable snapshot (including its frozen continuity block) for edits
+-- and later re-publication.
+CREATE TRIGGER IF NOT EXISTS trg_version_no_status_demote
+BEFORE UPDATE OF status ON experiment_versions
+WHEN OLD.status = 'published' AND NEW.status = 'draft'
+BEGIN
+    SELECT RAISE(ABORT, 'published version cannot be demoted to draft');
+END;
 """
 
 # Column/trigger definitions added after the first release. An existing
@@ -217,8 +227,10 @@ _MIGRATIONS = [
     ),
 ]
 
-# The immutability trigger gained continuity_json in its UPDATE OF list; an
-# old database keeps the old trigger body until it is explicitly replaced.
+# Triggers added after the first release: the immutability trigger gained
+# continuity_json in its UPDATE OF list, and published->draft demotion is now
+# blocked. An old database keeps old trigger bodies until they are explicitly
+# replaced, so both are reconciled here, idempotently, on every bootstrap.
 _TRIGGER_RECREATE = """
 DROP TRIGGER IF EXISTS trg_version_published_immutable;
 CREATE TRIGGER trg_version_published_immutable
@@ -227,6 +239,14 @@ ON experiment_versions
 WHEN OLD.status = 'published'
 BEGIN
     SELECT RAISE(ABORT, 'published version is immutable: create a new version');
+END;
+
+DROP TRIGGER IF EXISTS trg_version_no_status_demote;
+CREATE TRIGGER trg_version_no_status_demote
+BEFORE UPDATE OF status ON experiment_versions
+WHEN OLD.status = 'published' AND NEW.status = 'draft'
+BEGIN
+    SELECT RAISE(ABORT, 'published version cannot be demoted to draft');
 END;
 """
 

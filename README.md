@@ -75,8 +75,9 @@ curl -s -X POST $API/experiments/checkout_redesign/decide \
 
 - 实验创建时可附带首个版本；之后任何修改都必须调用 `POST /experiments/{key}/versions`
   生成**新版本**（草稿或直接发布）。
-- `published` 版本的 `config_json` 在数据库层由 SQLite 触发器禁止 UPDATE；
-  API 层也禁止再次发布（`409 version_already_published`）。
+- `published` 版本的 `config_json`（含冻结的 `continuity_json` 连续性配置）在数据库层由
+  SQLite 触发器禁止 UPDATE，已发布版本也禁止降回草稿；API 层禁止再次发布
+  （`409 version_already_published`）。
 - 未指定版本时，分流始终使用**最新已发布版本**；调用方可传 `version` 固定到任一历史发布版本
   （用于回溯当时的决策；固定到草稿返回 `409 version_not_published`）。
 
@@ -89,7 +90,8 @@ gate_position  = sha256("ns | namespace | user_key")[0:8] % 10000        # 命�
 
 - **版本不变 + 用户不变 ⇒ 变体分桶永远不变**（同版本重复决策结果固定）。
 - 每个实验拥有独立随机盐（创建时自动生成，也可显式传入），避免不同实验间变体分桶相关性。
-- 版本号参与变体哈希：发布新版本是一次有意的重新洗牌。
+- **版本号参与变体哈希**：发布新版本是一次有意的重新洗牌；声明 `continuity.mode=inherit`
+  的连续版本则把哈希种子固定为锚点版本的 `salt|version`（沿继承链传递），从而保持用户原组。
 - **门位置按命名空间共享**：同一命名空间内所有实验对同一用户看到同一个 `gate_position`，
   配合下文的“命名空间环”保证一个用户在同一时刻至多进入命名空间内的一个实验。
 - 变体桶与流量门位置是两条独立哈希，互不相关——因此 50% 总流量 + 50/50 变体时，
@@ -130,6 +132,43 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 - 白名单是显式强制覆盖，绕过环门（可理解为运维强制注入，不受互斥约束）。
 - 同一实验的版本采用“最新发布生效”模型：发布新版本即接管流量，旧版本保留为不可变历史，
   可通过 `version` 参数回放（环中该实验的切片会替换为被固定的历史版本）。
+
+### 跨版本分流连续性（继承 assignment_seed 与变体顺序）
+
+默认情况下版本号参与分桶哈希，发布新版本即有意重新洗牌；创建新版本时也可在 `continuity`
+中声明 `mode: "inherit"`，继承**同一实验某个已发布版本**的分桶种子与变体顺序，让老用户尽量
+留在原组。预检会拒绝以下请求（422 结构化 issues）：
+
+- 来源是草稿（`continuity_source_draft`）或版本不存在（`continuity_source_not_found`）；
+- 跨实验来源（`continuity_cross_experiment`）；
+- 未提供 `source_version`（`continuity_source_required`）；
+- 重命名映射重复来源 / 重复目标（`duplicate_rename_source/target`）、来源或目标变体不存在
+  （`rename_source_not_found` / `rename_target_not_found`）、两个来源变体汇入同一目标
+  （`rename_target_conflict`）；`reshuffle` 模式携带重命名（`continuity_renames_without_inherit`）。
+
+连续模式下，**入组资格完全以目标版本为准**（受众、时段、白名单、命名空间环与总流量）；
+连续性只决定变体维度：
+
+- 变体集合与权重不变 ⇒ 分桶位置与区间完全一致 ⇒ 同一 `user_key` 保持原组（`retained`）；
+- 只调整权重 ⇒ 仅跨过移动边界的桶换组（`weight_boundary_crossed`），其余用户不动；
+- 新增变体按稳定顺序承接落入新区间的桶（`variant_added`）；删除变体的桶由存活变体按序承接
+  （`variant_removed`）；重命名通过 `renames` 映射携带原组（`renamed_variant`，仍记 retained）；
+- 种子沿继承链传递（v3 继承 v2、v2 继承 v1 时三者共用同一桶位置），来源锚点顺序统一取来源
+  版本**实际分桶顺序**（继承顺序或字典序），与声明顺序无关；
+- 目标版本白名单把用户强制到与原组不同的变体时，轨迹与预演如实记 `whitelist_override`。
+
+决策轨迹在继承版本上多出 `continuity` 步骤，记录来源版本、分桶种子、原组（重命名前后）、
+当前组与换组原因；`bucket` 步骤的公式直接显示继承来的 `assignment_seed`。
+
+**迁移预演**：`POST /api/experiments/{key}/versions/migration-preview` 接收最多 10000 个
+带属性用户，对两个**已发布版本**分别内存决策（固定各自版本进环），统计入组（entered）、
+退出（exited）、保留（retained）、换组（switched）、两版均未入组（not_enrolled）数量，
+给出各类样例（每类最多 20 条）与换组原因细分；跨版本比较时自动组合继承链上的完整重命名链。
+预演**绝不写入曝光**（响应恒含 `exposures_written: false`），也不落任何决策轨迹。
+
+连续配置在版本创建时解析为冻结块（`assignment_seed`、有效变体顺序、重命名映射、来源快照），
+随版本存入 `continuity_json` 并与 `config_json` 一样被不可变触发器保护；已发布版本禁止降回
+草稿。历史决策与曝光的幂等重放逻辑完全不变。
 
 ### 校验规则（预检与发布时全部返回结构化 issues）
 
@@ -248,6 +287,7 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 | POST | `/api/experiments/{key}/decide` | 单个分流（可记录曝光、固定版本、指定时间） |
 | POST | `/api/experiments/decide/batch` | 一个用户跨 ≤500 个实验批量分流，单项错误隔离 |
 | POST | `/api/experiments/{key}/simulate?version=` | 蒙特卡洛模拟分布（不落曝光），返回配置占比 vs 实际占比、未命中原因分布 |
+| POST | `/api/experiments/{key}/versions/migration-preview` | 迁移预演：≤10000 带属性用户对比两个已发布版本的入组/退出/保留/换组（含换组原因与样例），不写曝光 |
 | GET | `/api/experiments/{key}/exposures/summary?version=` | 曝光汇总计数 |
 | GET | `/api/experiments/{key}/exposures?variant=&user_key=` | 曝光明细（含轨迹） |
 | GET | `/api/exposures/idempotency/{key}` | 幂等键回查任意决策 |
@@ -292,13 +332,15 @@ app/
   repository.py      # 数据访问层（实验/版本/曝光/指标/结果事件）
   metrics.py         # 指标归因（最近入组曝光+窗口）与效果统计（CI/提升/SRM）
   engine.py          # 决策流水线 + 幂等曝光写入
+  continuity.py      # 跨版本连续性：种子/顺序继承、重命名链、换组原因
+  migration.py       # 迁移预演（两版本对比，纯内存、不落曝光）
   services.py        # 预检 & 模拟
   routers/
-    experiments.py   # 实验/版本/分流/批量/模拟
+    experiments.py   # 实验/版本/分流/批量/模拟/迁移预演
     exposures.py     # 曝光汇总/明细/幂等回查
     metrics.py       # 指标定义/事件上报/效果分析
   main.py            # FastAPI 装配、统一错误处理
-tests/               # pytest 端到端测试（53 个用例，临时 SQLite）
+tests/               # pytest 端到端测试（含跨版本连续性回归用例），临时 SQLite
 run.py               # 启动入口
 ```
 
