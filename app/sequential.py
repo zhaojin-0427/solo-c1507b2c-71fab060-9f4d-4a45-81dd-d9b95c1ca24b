@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from datetime import timezone
 from typing import Any, Optional
 
 from . import metrics as metrics_mod
@@ -661,7 +662,17 @@ def evaluate_checkpoint(plan: dict[str, Any], agg: dict[str, Any],
                 "each arm for a sample variance (Welch Z)")
         m_c, m_t = c["value"], t_arm["value"]
         v_c, v_t = c["variance"], t_arm["variance"]
-        se = math.sqrt(v_c / n_c + v_t / n_t)
+        # The Welch standard error denominates by the number of VALID
+        # observations (attributed events with a finite value) in each arm —
+        # not by the number of enrolled exposures, which is a property of
+        # randomization and may exceed the observed response count.
+        k_c, k_t = c["observations"], t_arm["observations"]
+        if k_c < 2 or k_t < 2:
+            raise NotEvaluable(
+                "insufficient_information",
+                "continuous metrics need at least two valid observations in "
+                "each arm for a sample variance (Welch Z)")
+        se = math.sqrt(v_c / k_c + v_t / k_t)
         z_raw = (m_t - m_c) / se
         effect = {
             "kind": "mean_difference",
@@ -672,10 +683,11 @@ def evaluate_checkpoint(plan: dict[str, Any], agg: dict[str, Any],
             "oriented_difference": _round(orient * (m_t - m_c)),
         }
         stat_formula = (
-            f"z = (mean_t - mean_c) / sqrt(s_t²/n_t + s_c²/n_c) = "
-            f"({m_t:.6f} - {m_c:.6f}) / sqrt({v_t:.6f}/{n_t} + "
-            f"{v_c:.6f}/{n_c}) = {orient * z_raw:.6f} after "
-            f"{'favorable' if orient > 0 else 'unfavorable'}-direction sign; "
+            f"z = (mean_t - mean_c) / sqrt(s_t²/k_t + s_c²/k_c) = "
+            f"({m_t:.6f} - {m_c:.6f}) / sqrt({v_t:.6f}/{k_t} + "
+            f"{v_c:.6f}/{k_c}) = {orient * z_raw:.6f} after "
+            f"{'favorable' if orient > 0 else 'unfavorable'}-direction sign "
+            f"(k = valid observations, exposures n_c={n_c}, n_t={n_t}); "
             f"raw z = {z_raw:.6f}")
 
     z = orient * z_raw  # > 0 always means target moves in the metric direction
@@ -749,11 +761,18 @@ def evaluate_checkpoint(plan: dict[str, Any], agg: dict[str, Any],
     cp_block: dict[str, Any] = {"threshold": plan["conditional_power_threshold"]}
     theta_obs = z / math.sqrt(info_t)
     se_max = design_se_max(plan)
-    raw_diff = (p_t - p_c) if mtype == "binary" else (m_t - m_c)
     if plan.get("design_assumptions"):
-        delta = plan["design_assumptions"]["absolute_effect"]
+        raw_delta = plan["design_assumptions"]["absolute_effect"]
+        # The Brownian drift must point in the FAVORABLE direction: a
+        # minimize plan stores a negative absolute_effect, and conditional
+        # power is the probability of crossing the UPPER (win) boundary for
+        # the oriented statistic. Using the signed raw delta would turn a
+        # beneficial downward movement into a predicted failure.
+        delta = orient * raw_delta
         theta_design = delta / se_max
     else:
+        raw_delta = None
+        delta = None
         theta_design = None
 
     if not terminal and looks_remaining > 0 and not at_max_info:

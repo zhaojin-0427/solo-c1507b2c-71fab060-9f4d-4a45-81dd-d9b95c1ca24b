@@ -336,6 +336,28 @@ def submit_checkpoint(plan_key: str,
     cutoff = cutoff.astimezone(timezone.utc)
     cutoff_iso = to_iso(cutoff)
 
+    # Idempotent replay takes precedence over EVERY other rule: a cutoff that
+    # already has a frozen snapshot must return that snapshot verbatim, even
+    # if the wall clock has since moved past it or the plan has terminated.
+    existing = next((c for c in prior if c["cutoff_at"] == cutoff_iso), None)
+    if existing is not None:
+        return _checkpoint_response(plan, cutoff_iso, existing, True)
+
+    # New cutoffs must strictly advance in time.
+    if prior and cutoff_iso < prior[-1]["cutoff_at"]:
+        raise APIError(
+            422, "non_increasing_cutoff",
+            f"cutoff {cutoff_iso} is earlier than the previous checkpoint "
+            f"{prior[-1]['cutoff_at']}; back-dating checkpoints is not allowed")
+
+    now = utcnow()
+    if cutoff > now:
+        raise APIError(
+            422, "cutoff_in_future",
+            f"cutoff {cutoff_iso} is later than the current server time "
+            f"{to_iso(now)}; checkpoints can only freeze as-of slices of "
+            "data already observed")
+
     # A cutoff at or before the plan's creation cannot be inspected: the plan
     # did not exist then.
     if cutoff <= parse_iso(plan.created_at):
@@ -343,21 +365,6 @@ def submit_checkpoint(plan_key: str,
             422, "cutoff_before_plan",
             f"cutoff {cutoff_iso} must be later than plan creation "
             f"{plan.created_at}")
-
-    # Cutoffs must strictly advance; the same cutoff is an idempotent replay.
-    if prior and cutoff_iso <= prior[-1]["cutoff_at"]:
-        if cutoff_iso == prior[-1]["cutoff_at"]:
-            return _checkpoint_response(plan, cutoff_iso, prior[-1], True)
-        if cutoff_iso < prior[-1]["cutoff_at"]:
-            raise APIError(
-                422, "non_increasing_cutoff",
-                f"cutoff {cutoff_iso} is earlier than the previous checkpoint "
-                f"{prior[-1]['cutoff_at']}; back-dating checkpoints is not allowed")
-
-    # Duplicate cutoff anywhere in history (defensive; ordering covered above)
-    existing = next((c for c in prior if c["cutoff_at"] == cutoff_iso), None)
-    if existing is not None:
-        return _checkpoint_response(plan, cutoff_iso, existing, True)
 
     if prior and prior[-1]["result"]["terminal"]:
         raise ConflictError(
