@@ -272,6 +272,77 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 `event_key UNIQUE` 去重，因此同一时间范围重复查询结果逐字节一致；指标、曝光、事件连接全部
 带 `version_number`，历史版本分析不受后续发布影响。
 
+## CUPED 协变量校正
+
+在效果分析之上，可为**连续指标**在曝光前登记不可变 CUPED（Controlled-experiment Using
+Pre-Experiment Data）计划，用曝光前协变量降低连续指标的方差、提高检验灵敏度。
+
+### 计划（曝光前、不可变）
+
+`POST /api/experiments/{key}/versions/{v}/metrics/{metric}/cuped-plans`：
+
+| 字段 | 说明 |
+|---|---|
+| `plan_key` | 全局唯一计划键 |
+| `covariate_event_name` | 协变量事件名；只取**每位入组用户首次入组曝光之前**、回看窗口内的该事件 |
+| `preexposure_window_seconds` | 曝光前回看窗口（正整数秒）；协变量取半开区间 `[首次曝光 - W, 首次曝光)` |
+| `target_aggregation` | 截止前已归因目标事件按用户的汇总方式：`sum`（默认）或 `mean` |
+| `covariate_aggregation` | 窗口内协变量事件按用户的汇总方式：`sum`（默认）或 `mean` |
+| `missing_covariate_policy` | `exclude`（默认，无协变量的用户排除）或 `population_mean`（以总体协变量均值填充） |
+
+创建时拒绝（422 结构化 issues / 409）：
+
+- 指标不是连续指标（`metric_not_continuous`）；回看窗口非正（请求层 400）；
+- 该版本**已有任何曝光记录**（`plan_after_exposure`）——计划必须在版本产生曝光前登记，
+  窗口锚点才能严格落在处理期之前，杜绝数据泄漏；
+- 同一版本指标已有 CUPED 计划（`cuped_plan_exists_for_metric`），或 `plan_key` 重复。
+
+计划与版本配置一样不可变、不可删除（无更新端点，SQLite 触发器在存储层禁止
+UPDATE/DELETE）；`GET /api/experiments/{key}/cuped-plans` 与
+`GET /api/cuped-plans/{plan_key}` 可列示与回查。
+
+### 快照：按截止时间冻结、防泄漏配对
+
+`POST /api/cuped-plans/{plan_key}/snapshots`，载荷 `{"cutoff_at": "..."}`：
+
+- 只读取 `recorded_at < cutoff` 的曝光与 `occurred_at < cutoff` 的事件；未来截止时间拒绝
+  （422 `cutoff_in_future`），早于计划创建的截止时间拒绝（`cutoff_before_plan`）。
+- **协变量 X**：仅取每位入组用户**首次入组曝光之前**、`[t0 - W, t0)` 内的协变量事件；
+  曝光时刻及之后的事件永不进入 X，处理期数据无法泄漏。
+- **目标 Y**：截止前的目标事件沿用普通效果分析的跨版本唯一归属规则（全版本最近入组曝光
+  决定归属版本）、归因窗口与数值校验，再按用户 `sum`/`mean` 汇总为一个 Y。
+- **缺失协变量**：`exclude` 直接剔除该用户；`population_mean` 保留用户并以**完整配对**的
+  混合协变量均值填充 X（其校正项为 0，Y 保持原值）。无目标事件的用户不计入配对。
+
+θ 用**全部有效配对（跨所有变体混合）一次性估计**：
+
+```
+θ = Cov(X, Y) / Var(X),   x̄ = mean(X)（完整配对）
+Y_cuped = Y - θ·(X - x̄)
+```
+
+混合居中保留总体均值与无偏的变体间差值。响应按变体给出原始均值/方差与 95% CI、
+**校正均值/方差与 95% CI**、变体的**方差缩减率** `1 - s²_cuped/s²_raw` 与入组/配对/填充
+用户数；非对照变体另给原始差值、**校正差值**及各自的 Welch 95% CI、差值 SE 的方差缩减率
+和按指标方向计算的 `favorable`。顶层 `totals` 给出 θ、入组用户、有目标用户、有效配对数、
+排除明细（`no_target` / `missing_covariate`）、协变量与目标事件用量（含窗口外/缺数值计数）
+以及混合 SSE 口径的总体方差缩减率；每个数字都带代入实际值的 `formula`。
+
+### 异常标记（永不覆盖原分析）
+
+快照同时保留原始与校正两套结果；以下情况进入 `anomalies`：
+
+- `zero_covariate_variance`：完整配对不足 2 个或协变量零方差，θ 不可估——校正列为
+  `null`，CI/差值回退为原始分析；
+- `insufficient_sample`：某变体配对用户数少于指标的 `min_sample_size`；
+- `adjusted_variance_increased`：混合 SSE（或差值 SE）口径下校正后方差反而变大——
+  标记异常，但原始与校正结果都原样返回。
+
+**冻结与历史不可改写**：同一计划 + 同一截止时间重复请求返回首次的冻结快照
+（`duplicate=true`，结果逐字节一致）；之后上报的协变量/目标事件不影响历史快照，只在更晚的
+截止时间快照（序号自增）中体现。`GET /api/cuped-plans/{plan_key}/snapshots` 列出历史摘要，
+`GET /api/cuped-plans/{plan_key}/snapshots/{sequence}` 按序号取回冻结快照。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -297,6 +368,12 @@ starts_with, ends_with, exists`，字段支持点路径（如 `user.address.city
 | GET | `/api/experiments/{key}/events?event_name=&user_key=` | 结果事件明细 |
 | GET | `/api/experiments/{key}/events/{event_key}` | 按事件键回查 |
 | GET | `/api/experiments/{key}/versions/{v}/metrics/{metric}/analysis?start_at=&end_at=` | 指标归因与效果分析（比率/均值、提升、95% CI、SRM、样本不足、对账计数与公式） |
+| POST | `/api/experiments/{key}/versions/{v}/metrics/{metric}/cuped-plans` | 为连续指标登记**曝光前**不可变 CUPED 计划（协变量事件/回看窗口/汇总方式/缺失策略） |
+| GET | `/api/experiments/{key}/cuped-plans` | 列出实验的 CUPED 计划 |
+| GET | `/api/cuped-plans/{plan_key}` | 取回单个不可变 CUPED 计划 |
+| POST | `/api/cuped-plans/{plan_key}/snapshots` | 按截止时间生成（或回放冻结的）CUPED 快照 |
+| GET | `/api/cuped-plans/{plan_key}/snapshots` | CUPED 快照历史摘要 |
+| GET | `/api/cuped-plans/{plan_key}/snapshots/{n}` | 按序号取回冻结快照 |
 
 所有错误使用统一信封：
 
@@ -331,6 +408,8 @@ app/
   validation.py      # 结构校验 + 命名空间/时段互斥校验
   repository.py      # 数据访问层（实验/版本/曝光/指标/结果事件）
   metrics.py         # 指标归因（最近入组曝光+窗口）与效果统计（CI/提升/SRM）
+  sequential.py      # 成组序贯检验：α 消耗边界、检查点统计、条件功效
+  cuped.py           # CUPED 协变量校正：防泄漏配对、θ 估计、原始/校正均值、CI、方差缩减
   engine.py          # 决策流水线 + 幂等曝光写入
   continuity.py      # 跨版本连续性：种子/顺序继承、重命名链、换组原因
   migration.py       # 迁移预演（两版本对比，纯内存、不落曝光）
@@ -339,6 +418,8 @@ app/
     experiments.py   # 实验/版本/分流/批量/模拟/迁移预演
     exposures.py     # 曝光汇总/明细/幂等回查
     metrics.py       # 指标定义/事件上报/效果分析
+    sequential.py    # 序贯计划与检查点
+    cuped.py         # CUPED 计划与冻结快照
   main.py            # FastAPI 装配、统一错误处理
 tests/               # pytest 端到端测试（含跨版本连续性回归用例），临时 SQLite
 run.py               # 启动入口

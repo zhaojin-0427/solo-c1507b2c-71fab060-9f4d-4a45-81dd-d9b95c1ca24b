@@ -991,3 +991,167 @@ def events_before(experiment_key: str, event_name: str,
         (experiment_key, event_name, cutoff_iso)).fetchall()
     return [_event_row(r) for r in rows]
 
+
+# ---------------------------------------------------------------------------
+# CUPED covariate-adjustment plans + frozen snapshots
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CupedPlan:
+    id: int
+    plan_key: str
+    experiment_key: str
+    version_number: int
+    metric_key: str
+    covariate_event_name: str
+    preexposure_window_seconds: int
+    target_aggregation: str
+    covariate_aggregation: str
+    missing_covariate_policy: str
+    created_at: str
+
+
+def _row_to_cuped_plan(row: Any) -> CupedPlan:
+    return CupedPlan(
+        id=row["id"], plan_key=row["plan_key"],
+        experiment_key=row["experiment_key"],
+        version_number=row["version_number"],
+        metric_key=row["metric_key"],
+        covariate_event_name=row["covariate_event_name"],
+        preexposure_window_seconds=row["preexposure_window_seconds"],
+        target_aggregation=row["target_aggregation"],
+        covariate_aggregation=row["covariate_aggregation"],
+        missing_covariate_policy=row["missing_covariate_policy"],
+        created_at=row["created_at"])
+
+
+def create_cuped_plan(spec: dict[str, Any]) -> CupedPlan:
+    try:
+        with transaction() as tx:
+            cur = tx.execute(
+                "INSERT INTO cuped_plans (plan_key, experiment_key, "
+                " version_number, metric_key, covariate_event_name, "
+                " preexposure_window_seconds, target_aggregation, "
+                " covariate_aggregation, missing_covariate_policy, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (spec["plan_key"], spec["experiment_key"],
+                 spec["version_number"], spec["metric_key"],
+                 spec["covariate_event_name"],
+                 spec["preexposure_window_seconds"],
+                 spec["target_aggregation"], spec["covariate_aggregation"],
+                 spec["missing_covariate_policy"], to_iso(utcnow())))
+            plan_id = cur.lastrowid
+    except Exception as exc:
+        if _is_unique(exc):
+            msg = str(exc)
+            if "plan_key" in msg:
+                raise ConflictError(
+                    "cuped_plan_exists",
+                    f"cuped plan {spec['plan_key']!r} already exists")
+            raise ConflictError(
+                "cuped_plan_exists_for_metric",
+                f"a cuped plan already exists for "
+                f"{spec['experiment_key']!r} v{spec['version_number']} "
+                f"metric {spec['metric_key']!r}")
+        raise
+    return get_cuped_plan_by_id(plan_id)
+
+
+def get_cuped_plan_by_id(plan_id: int) -> CupedPlan:
+    row = get_conn().execute(
+        "SELECT * FROM cuped_plans WHERE id = ?", (plan_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"cuped plan id {plan_id} not found")
+    return _row_to_cuped_plan(row)
+
+
+def get_cuped_plan(plan_key: str) -> CupedPlan:
+    row = get_conn().execute(
+        "SELECT * FROM cuped_plans WHERE plan_key = ?", (plan_key,)
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"cuped plan {plan_key!r} not found")
+    return _row_to_cuped_plan(row)
+
+
+def get_cuped_plan_for_metric(experiment_key: str, version_number: int,
+                              metric_key: str) -> Optional[CupedPlan]:
+    row = get_conn().execute(
+        "SELECT * FROM cuped_plans WHERE experiment_key = ? "
+        "AND version_number = ? AND metric_key = ?",
+        (experiment_key, version_number, metric_key)).fetchone()
+    return _row_to_cuped_plan(row) if row else None
+
+
+def list_cuped_plans(experiment_key: str) -> list[CupedPlan]:
+    get_experiment(experiment_key)  # 404 early
+    rows = get_conn().execute(
+        "SELECT * FROM cuped_plans WHERE experiment_key = ? "
+        "ORDER BY created_at, plan_key", (experiment_key,)).fetchall()
+    return [_row_to_cuped_plan(r) for r in rows]
+
+
+def insert_cuped_snapshot(plan_key: str, cutoff_iso: str,
+                          theta: Optional[float], paired_users: int,
+                          anomalies: list[str], result: dict[str, Any]
+                          ) -> tuple[bool, dict[str, Any]]:
+    """Insert a frozen CUPED snapshot; a duplicate cutoff re-serves stored row.
+
+    Returns (inserted_now, stored_row_dict). The duplicate-cutoff check and
+    the sequence allocation happen in one serialized write transaction, so
+    concurrent first-time submissions can never collide.
+    """
+    with transaction() as tx:
+        existing = tx.execute(
+            "SELECT id FROM cuped_snapshots WHERE plan_key = ? AND cutoff_at = ?",
+            (plan_key, cutoff_iso)).fetchone()
+        if existing is not None:
+            snapshot_id = existing["id"]
+            inserted = False
+        else:
+            next_sequence = tx.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next "
+                "FROM cuped_snapshots WHERE plan_key = ?",
+                (plan_key,)).fetchone()["next"]
+            cur = tx.execute(
+                "INSERT INTO cuped_snapshots (plan_key, sequence, cutoff_at, "
+                " theta, paired_users, anomalies_json, result_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (plan_key, next_sequence, cutoff_iso, theta, paired_users,
+                 json.dumps(anomalies), json.dumps(result),
+                 to_iso(utcnow())))
+            snapshot_id = cur.lastrowid
+            inserted = True
+    return inserted, get_cuped_snapshot_by_id(snapshot_id)
+
+
+def get_cuped_snapshot_by_id(snapshot_id: int) -> dict[str, Any]:
+    row = get_conn().execute(
+        "SELECT * FROM cuped_snapshots WHERE id = ?", (snapshot_id,)
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"cuped snapshot id {snapshot_id} not found")
+    return _cuped_snapshot_row(row)
+
+
+def get_cuped_snapshot_at(plan_key: str, cutoff_iso: str) -> Optional[dict[str, Any]]:
+    row = get_conn().execute(
+        "SELECT * FROM cuped_snapshots WHERE plan_key = ? AND cutoff_at = ?",
+        (plan_key, cutoff_iso)).fetchone()
+    return _cuped_snapshot_row(row) if row else None
+
+
+def list_cuped_snapshots(plan_key: str) -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT * FROM cuped_snapshots WHERE plan_key = ? ORDER BY sequence",
+        (plan_key,)).fetchall()
+    return [_cuped_snapshot_row(r) for r in rows]
+
+
+def _cuped_snapshot_row(row: Any) -> dict[str, Any]:
+    d = dict(row)
+    d["anomalies"] = json.loads(d.pop("anomalies_json"))
+    d["result"] = json.loads(d.pop("result_json"))
+    return d
+

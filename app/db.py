@@ -165,6 +165,83 @@ BEGIN
     SELECT RAISE(ABORT, 'checkpoint snapshots are immutable and cannot be deleted');
 END;
 
+-- ---------------------------------------------------------------------------
+-- CUPED covariate-adjustment plans and frozen snapshots.
+--
+-- A CUPED plan is written BEFORE any exposure on the analyzed version (the
+-- API enforces this) and is immutable afterwards: no UPDATE endpoint exists
+-- and the triggers below block in-place changes at the storage layer.
+-- Snapshots are as-of cuts: covariates are only read from a fixed window
+-- strictly before each user's FIRST enrolled exposure, targets only from
+-- events occurred before the cutoff, and result_json is frozen at submit
+-- time — re-requesting the same cutoff re-serves the stored row verbatim.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS cuped_plans (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_key                   TEXT NOT NULL UNIQUE,
+    experiment_key             TEXT NOT NULL REFERENCES experiments(key),
+    version_number             INTEGER NOT NULL,
+    metric_key                 TEXT NOT NULL,
+    covariate_event_name       TEXT NOT NULL,
+    preexposure_window_seconds INTEGER NOT NULL
+                               CHECK (preexposure_window_seconds > 0),
+    target_aggregation         TEXT NOT NULL
+                               CHECK (target_aggregation IN ('sum', 'mean')),
+    covariate_aggregation      TEXT NOT NULL
+                               CHECK (covariate_aggregation IN ('sum', 'mean')),
+    missing_covariate_policy   TEXT NOT NULL
+                               CHECK (missing_covariate_policy IN
+                                      ('exclude', 'population_mean')),
+    created_at                 TEXT NOT NULL,
+    UNIQUE (experiment_key, version_number, metric_key)
+);
+
+CREATE TABLE IF NOT EXISTS cuped_snapshots (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_key         TEXT NOT NULL REFERENCES cuped_plans(plan_key),
+    sequence         INTEGER NOT NULL,
+    cutoff_at        TEXT NOT NULL,
+    theta            REAL,
+    paired_users     INTEGER NOT NULL,
+    anomalies_json   TEXT NOT NULL,
+    result_json      TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    UNIQUE (plan_key, cutoff_at),
+    UNIQUE (plan_key, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cuped_plans_exp
+    ON cuped_plans (experiment_key, version_number);
+CREATE INDEX IF NOT EXISTS idx_cuped_snapshots_plan
+    ON cuped_snapshots (plan_key, sequence);
+
+-- CUPED plans and snapshots are write-once, exactly like sequential plans:
+-- the storage layer refuses every modification or deletion outright.
+CREATE TRIGGER IF NOT EXISTS trg_cuped_plan_no_update
+BEFORE UPDATE ON cuped_plans
+BEGIN
+    SELECT RAISE(ABORT, 'cuped plans are immutable: create a new plan');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cuped_plan_no_delete
+BEFORE DELETE ON cuped_plans
+BEGIN
+    SELECT RAISE(ABORT, 'cuped plans are immutable and cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cuped_snapshot_no_update
+BEFORE UPDATE ON cuped_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'cuped snapshots are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cuped_snapshot_no_delete
+BEFORE DELETE ON cuped_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'cuped snapshots are immutable and cannot be deleted');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_versions_exp_status
     ON experiment_versions (experiment_key, status);
 CREATE INDEX IF NOT EXISTS idx_versions_ns

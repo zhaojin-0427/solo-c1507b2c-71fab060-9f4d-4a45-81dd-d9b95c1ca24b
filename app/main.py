@@ -19,6 +19,8 @@ from .config import settings
 from .db import init_db
 from .errors import APIError
 from .routers import experiments as experiments_router
+from .routers.cuped import plans_router as cuped_plans_router
+from .routers.cuped import router as cuped_router
 from .routers.exposures import router as exposures_router
 from .routers.exposures import router_lookup as exposure_lookup_router
 from .routers.metrics import router as metrics_router
@@ -80,6 +82,8 @@ def create_app() -> FastAPI:
     # prefixes differ, but plans_router is included first for clarity.
     app.include_router(sequential_plans_router, prefix=api)
     app.include_router(sequential_router, prefix=api)
+    app.include_router(cuped_plans_router, prefix=api)
+    app.include_router(cuped_router, prefix=api)
     return app
 
 

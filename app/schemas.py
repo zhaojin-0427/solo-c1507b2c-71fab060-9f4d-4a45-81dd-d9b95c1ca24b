@@ -772,3 +772,167 @@ class CheckpointSummaryRow(StrictModel):
 class CheckpointHistoryResponse(StrictModel):
     plan: SequentialPlanOut
     checkpoints: list[CheckpointSummaryRow]
+
+
+# ---------------------------------------------------------------------------
+# CUPED: immutable pre-exposure covariate-adjustment plans + snapshots
+# ---------------------------------------------------------------------------
+
+CupedAggregation = Literal["sum", "mean"]
+MissingCovariatePolicy = Literal["exclude", "population_mean"]
+
+
+class CupedPlanCreate(StrictModel):
+    """Immutable pre-exposure CUPED plan for one version's continuous metric."""
+
+    plan_key: str = Field(min_length=1, max_length=64,
+                          pattern=r"^[A-Za-z0-9_.\-]+$")
+    covariate_event_name: str = Field(
+        min_length=1, max_length=128,
+        description="pre-exposure event aggregated into the user-level covariate X")
+    preexposure_window_seconds: int = Field(
+        ge=1, le=60 * 60 * 24 * 366,
+        description="covariates only count in [first_exposure - window, first_exposure)")
+    target_aggregation: CupedAggregation = Field(
+        default="sum",
+        description="how attributed target events before the cutoff collapse to one Y per user")
+    covariate_aggregation: CupedAggregation = Field(
+        default="sum",
+        description="how pre-exposure covariate events collapse to one X per user")
+    missing_covariate_policy: MissingCovariatePolicy = Field(
+        default="exclude",
+        description="drop users without a covariate, or fill X with the pooled mean")
+
+
+class CupedPlanOut(StrictModel):
+    plan_key: str
+    experiment_key: str
+    version_number: int
+    metric: MetricDefOut
+    covariate_event_name: str
+    preexposure_window_seconds: int
+    target_aggregation: CupedAggregation
+    covariate_aggregation: CupedAggregation
+    missing_covariate_policy: MissingCovariatePolicy
+    snapshots_recorded: int
+    created_at: datetime
+
+
+class CupedPlanListResponse(StrictModel):
+    items: list[CupedPlanOut]
+
+
+class CupedSnapshotCreate(StrictModel):
+    cutoff_at: datetime = Field(
+        description="as-of instant: only exposures recorded before and events "
+                    "occurred before this instant are used")
+
+
+class CupedThetaBlock(StrictModel):
+    value: Optional[float] = Field(
+        default=None, description="covariance(X,Y)/variance(X) over all valid paired users; null when not estimable")
+    estimable: bool
+    covariance: Optional[float] = None
+    covariate_variance: Optional[float] = None
+    covariate_mean: Optional[float] = None
+    paired_users: int
+    formula: str
+
+
+class CupedExcludedUsers(StrictModel):
+    total: int
+    no_target: int = Field(
+        description="enrolled users with no valid attributed target event before the cutoff")
+    missing_covariate: int = Field(
+        description="users excluded by the missing-covariate policy (no valid pre-exposure X)")
+
+
+class CupedVariantRow(StrictModel):
+    variant_key: str
+    is_control: bool
+    enrolled_users: int
+    paired_users: int
+    filled_covariate_users: int
+    raw_mean: Optional[float] = None
+    adjusted_mean: Optional[float] = None
+    raw_variance: Optional[float] = None
+    adjusted_variance: Optional[float] = None
+    variance_reduction_rate: Optional[float] = Field(
+        default=None,
+        description="1 - s²(adjusted)/s²(raw) for this variant; null when not estimable")
+    ci95: ConfidenceInterval = Field(
+        default_factory=ConfidenceInterval,
+        description="95% CI of the adjusted mean (raw mean CI when adjustment is unavailable)")
+    raw_ci95: ConfidenceInterval = Field(default_factory=ConfidenceInterval)
+    insufficient_sample: bool
+    formula: str
+
+
+class CupedComparisonRow(StrictModel):
+    variant_key: str
+    raw_difference: Optional[float] = None
+    adjusted_difference: Optional[float] = None
+    raw_ci95: ConfidenceInterval = Field(default_factory=ConfidenceInterval)
+    ci95: ConfidenceInterval = Field(
+        default_factory=ConfidenceInterval,
+        description="95% Welch CI of the adjusted mean difference (raw when no adjustment)")
+    variance_reduction_rate: Optional[float] = None
+    favorable: Optional[bool] = None
+    formula: str
+
+
+class CupedTotals(StrictModel):
+    enrolled_users: int
+    users_with_target: int
+    paired_users: int
+    excluded_users: CupedExcludedUsers
+    filled_covariate_users: int
+    target_events_attributed: int
+    target_events_excluded: dict[str, int]
+    covariate_events_used: int
+    covariate_events_invalid_value: int
+    overall_variance_reduction_rate: Optional[float] = Field(
+        default=None,
+        description="1 - pooled SSE(adjusted)/SSE(raw) over every included user")
+
+
+class CupedSnapshotResult(StrictModel):
+    theta: CupedThetaBlock
+    variants: list[CupedVariantRow]
+    comparisons: list[CupedComparisonRow]
+    totals: CupedTotals
+    anomalies: list[str] = Field(
+        description="zero_covariate_variance / insufficient_sample / adjusted_variance_increased; "
+                    "the raw analysis is always reported alongside and never overwritten")
+    adjusted: bool = Field(
+        description="whether a CUPED theta was estimable and adjusted columns are populated")
+
+
+class CupedSnapshotOut(StrictModel):
+    plan_key: str
+    experiment_key: str
+    version_number: int
+    metric_key: str
+    sequence: int
+    cutoff_at: datetime
+    submitted_at: datetime
+    duplicate: bool = False
+    result: CupedSnapshotResult
+    formulas: dict[str, str]
+
+
+class CupedSnapshotSummaryRow(StrictModel):
+    sequence: int
+    snapshot_id: int
+    cutoff_at: datetime
+    theta: Optional[float]
+    paired_users: int
+    anomalies: list[str]
+    adjusted: bool
+    overall_variance_reduction_rate: Optional[float]
+    formula: str
+
+
+class CupedSnapshotHistoryResponse(StrictModel):
+    plan: CupedPlanOut
+    snapshots: list[CupedSnapshotSummaryRow]
