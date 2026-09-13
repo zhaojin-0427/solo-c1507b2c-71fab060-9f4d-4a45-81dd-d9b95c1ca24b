@@ -343,6 +343,76 @@ Y_cuped = Y - θ·(X - x̄)
 截止时间快照（序号自增）中体现。`GET /api/cuped-plans/{plan_key}/snapshots` 列出历史摘要，
 `GET /api/cuped-plans/{plan_key}/snapshots/{sequence}` 按序号取回冻结快照。
 
+## 多指标发布决策
+
+在效果分析之上，可为**每个配置版本**在曝光前登记不可变的发布决策计划：选定对照与目标变体，
+引用 **1 项主指标**及若干**护栏指标**——为主指标设置**最小有利效应**，为护栏设置**非劣界值**，
+并选择 **Holm 或 Bonferroni** 多重性校正；快照按截止时间冻结，给出三态发布结论。
+
+### 计划（曝光前、不可变）
+
+`POST /api/experiments/{key}/versions/{v}/release-plans`：
+
+| 字段 | 说明 |
+|---|---|
+| `plan_key` | 全局唯一计划键（重复返回 `409 release_plan_exists`） |
+| `control_variant_key` / `target_variant_key` | 两臂；对照必须等于版本声明的对照变体，且都须有正流量 |
+| `primary` | `{metric_key, min_favorable_effect}`：主指标 + 越过门槛所需的最小有利效应（按指标优化方向计，≥0） |
+| `guardrails` | `[{metric_key, non_inferiority_margin}]`：护栏及其非劣界值（可容忍的最大不利偏移，≥0） |
+| `correction` | `holm`（默认）或 `bonferroni`，作用于计划内全部可评估指标 |
+| `alpha` | 族系显著性水平，默认 0.05 |
+
+创建时拒绝（422 结构化 issues / 409）：
+
+- 变体不存在（`unknown_variant`）、两臂相同（`distinct_arms_required`）、对照与版本声明不符
+  （`control_mismatch`）、臂流量为 0（`zero_allocation_arm`）；
+- **跨版本指标**（`metric_not_on_version`）：引用的指标必须定义在本版本上；
+- **重复指标**（`duplicate_metric`）：主指标与护栏、或护栏之间引用同一指标；
+- **无界归因窗口指标**（`unbounded_attribution_window`）：窗口为 0 的指标无法判定"窗口已走完"，
+  不得进入计划；
+- 该版本**已有任何入组曝光**（`409 plan_after_exposure`）——计划必须先于曝光登记。
+
+计划与版本配置一样不可变、不可删除（无更新端点，SQLite 触发器在存储层禁止 UPDATE/DELETE）；
+`GET /api/experiments/{key}/release-plans` 与 `GET /api/release-plans/{plan_key}` 可列示与回查。
+
+### 快照：按截止时间冻结、窗口走完才计入
+
+`POST /api/release-plans/{plan_key}/snapshots`，载荷 `{"cutoff_at": "..."}`：
+
+- 只读取 `recorded_at < cutoff` 的曝光与 `occurred_at < cutoff` 的事件；未来截止时间拒绝
+  （422 `cutoff_in_future`），早于计划创建的截止时间拒绝（`cutoff_before_plan`）。
+- **归因窗口尚未走完的用户被排除**：仅当 `首次入组曝光 + attribution_window_seconds <= cutoff`
+  时用户才进入该指标的两臂样本（窗口未走完的用户之后仍可能转化，计入会低估转化率）；
+  排除按指标分别进行（各指标窗口不同），计入 `excluded_users.window_incomplete`，其事件计入
+  `exclusions.window_incomplete_user`。
+- 事件归因沿用普通效果分析的跨版本唯一归属规则（全版本最近入组曝光决定归属版本）、
+  归因窗口与数值校验；归属到计划外第三变体的事件计入 `exclusions.variant_not_in_plan`。
+
+每项指标返回：两臂**样本量**（二元为合格用户与转化用户，连续为合格用户与有效事件数）、
+**效应**（按指标方向定向：θ̂ = orient·(目标 − 对照)，正值恒为有利）、**95% 置信区间**
+（θ̂ ± 1.96·SE）、**校正前后 p 值**与**阈值差距**（`threshold_gap = θ̂ − 阈值`，主指标阈值为
+`min_favorable_effect`，护栏为 `−non_inferiority_margin`）。主指标做单侧优效检验
+`p = 1 − Φ(θ̂/SE)`；护栏做单侧越界检验 `p = Φ((θ̂ + m)/SE)`（p 小 = 显著危害）。
+校正族为全部**可评估**指标（主指标优效 + 各护栏越界），Holm 为逐步下调、Bonferroni 为
+统一乘 k；不可评估的指标（臂为空、零方差、连续指标观测不足）p 值为 null、不进校正族，
+且永远不能视为通过。
+
+### 三态决策
+
+- **可发布（`ship`）**：主指标越过效应门槛（`threshold_gap ≥ 0`）**且**校正后 p < alpha，
+  同时**全部护栏未越过非劣界值**（点估计在界值安全侧且未显著越界）；
+- **不可发布（`do_not_ship`）**：**任一护栏显著越界**（校正后越界 p < alpha）；
+- **证据不足（`insufficient_evidence`）**：其余一切情况——主指标不显著或未过门槛、
+  护栏点估计越界但未达显著、或指标尚不可评估。
+
+`decision.reasons` 给出机器可读的原因码（如 `primary_not_significant_after_correction`、
+`guardrail_crossed_bound_not_significant:retain`、`guardrail_violated:crash`），每项指标带
+代入实际数值的 `formula`，顶层 `formulas` 为公式词典。同一计划 + 同一截止时间重复请求
+复用首次的冻结结果（`duplicate=true`，逐字节一致），之后到达的数据——哪怕时间戳落在
+冻结窗口内——都**不改写历史快照**，只在更晚截止时间的快照（序号自增）中体现。
+`GET /api/release-plans/{plan_key}/snapshots` 列出历史摘要，
+`GET /api/release-plans/{plan_key}/snapshots/{n}` 按序号取回。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -374,6 +444,12 @@ Y_cuped = Y - θ·(X - x̄)
 | POST | `/api/cuped-plans/{plan_key}/snapshots` | 按截止时间生成（或回放冻结的）CUPED 快照 |
 | GET | `/api/cuped-plans/{plan_key}/snapshots` | CUPED 快照历史摘要 |
 | GET | `/api/cuped-plans/{plan_key}/snapshots/{n}` | 按序号取回冻结快照 |
+| POST | `/api/experiments/{key}/versions/{v}/release-plans` | 为版本登记**曝光前**不可变发布决策计划（主指标 + 护栏、Holm/Bonferroni） |
+| GET | `/api/experiments/{key}/release-plans` | 列出实验的发布决策计划 |
+| GET | `/api/release-plans/{plan_key}` | 取回单个不可变发布决策计划 |
+| POST | `/api/release-plans/{plan_key}/snapshots` | 按截止时间生成（或回放冻结的）发布决策快照（三态结论） |
+| GET | `/api/release-plans/{plan_key}/snapshots` | 发布决策快照历史摘要 |
+| GET | `/api/release-plans/{plan_key}/snapshots/{n}` | 按序号取回冻结的发布决策快照 |
 
 所有错误使用统一信封：
 
@@ -410,6 +486,7 @@ app/
   metrics.py         # 指标归因（最近入组曝光+窗口）与效果统计（CI/提升/SRM）
   sequential.py      # 成组序贯检验：α 消耗边界、检查点统计、条件功效
   cuped.py           # CUPED 协变量校正：防泄漏配对、θ 估计、原始/校正均值、CI、方差缩减
+  release.py         # 多指标发布决策：窗口走完的合格样本、定向效应/CI/p 值、Holm/Bonferroni、三态结论
   engine.py          # 决策流水线 + 幂等曝光写入
   continuity.py      # 跨版本连续性：种子/顺序继承、重命名链、换组原因
   migration.py       # 迁移预演（两版本对比，纯内存、不落曝光）
@@ -420,6 +497,7 @@ app/
     metrics.py       # 指标定义/事件上报/效果分析
     sequential.py    # 序贯计划与检查点
     cuped.py         # CUPED 计划与冻结快照
+    release.py       # 发布决策计划与冻结快照
   main.py            # FastAPI 装配、统一错误处理
 tests/               # pytest 端到端测试（含跨版本连续性回归用例），临时 SQLite
 run.py               # 启动入口

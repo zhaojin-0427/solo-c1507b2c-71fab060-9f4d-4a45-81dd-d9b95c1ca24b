@@ -936,3 +936,176 @@ class CupedSnapshotSummaryRow(StrictModel):
 class CupedSnapshotHistoryResponse(StrictModel):
     plan: CupedPlanOut
     snapshots: list[CupedSnapshotSummaryRow]
+
+
+# ---------------------------------------------------------------------------
+# Multi-metric release decisions: immutable pre-exposure plans + frozen
+# decision snapshots (primary metric + guardrails, Holm/Bonferroni)
+# ---------------------------------------------------------------------------
+
+CorrectionMethod = Literal["holm", "bonferroni"]
+ReleaseDecision = Literal["ship", "do_not_ship", "insufficient_evidence"]
+ReleaseMetricStatus = Literal[
+    "pass", "below_threshold", "not_significant",
+    "within_bound", "crossed_not_significant", "violated",
+    "not_evaluable",
+]
+
+
+class ReleasePrimarySpec(StrictModel):
+    metric_key: str = Field(min_length=1, max_length=64)
+    min_favorable_effect: float = Field(
+        ge=0.0,
+        description="minimum oriented effect (target - control in the "
+                    "metric's favorable direction) required to ship")
+
+
+class ReleaseGuardrailSpec(StrictModel):
+    metric_key: str = Field(min_length=1, max_length=64)
+    non_inferiority_margin: float = Field(
+        ge=0.0,
+        description="tolerable oriented harm; the guardrail is violated when "
+                    "the effect is significantly below -margin")
+
+
+class ReleasePlanCreate(StrictModel):
+    """Immutable pre-exposure release-decision plan for one version."""
+
+    plan_key: str = Field(min_length=1, max_length=64,
+                          pattern=r"^[A-Za-z0-9_.\-]+$")
+    control_variant_key: str = Field(min_length=1, max_length=64)
+    target_variant_key: str = Field(min_length=1, max_length=64)
+    primary: ReleasePrimarySpec
+    guardrails: list[ReleaseGuardrailSpec] = Field(
+        default_factory=list, max_length=20,
+        description="guardrail metrics with non-inferiority margins")
+    correction: CorrectionMethod = Field(
+        default="holm",
+        description="multiple-comparison correction across the plan metrics")
+    alpha: float = Field(default=0.05, gt=0.0, lt=1.0,
+                         description="family-wise significance level")
+
+
+class ReleasePrimaryOut(StrictModel):
+    metric: MetricDefOut
+    min_favorable_effect: float
+
+
+class ReleaseGuardrailOut(StrictModel):
+    metric: MetricDefOut
+    non_inferiority_margin: float
+
+
+class ReleasePlanOut(StrictModel):
+    plan_key: str
+    experiment_key: str
+    version_number: int
+    control_variant_key: str
+    target_variant_key: str
+    primary: ReleasePrimaryOut
+    guardrails: list[ReleaseGuardrailOut]
+    correction: CorrectionMethod
+    alpha: float
+    snapshots_recorded: int
+    created_at: datetime
+
+
+class ReleasePlanListResponse(StrictModel):
+    items: list[ReleasePlanOut]
+
+
+class ReleaseSnapshotCreate(StrictModel):
+    cutoff_at: datetime = Field(
+        description="as-of instant: only exposures recorded before and events "
+                    "occurred before this instant are used, and only users "
+                    "whose attribution window has fully elapsed count")
+
+
+class ReleaseArmRow(StrictModel):
+    variant_key: str
+    role: Literal["control", "target"]
+    users: int = Field(
+        description="eligible enrolled users (attribution window elapsed)")
+    conversions: Optional[int] = Field(
+        default=None, description="binary: distinct converting users")
+    observations: Optional[int] = Field(
+        default=None, description="continuous: valid attributed events")
+    value: Optional[float] = Field(
+        default=None, description="conversion rate (binary) or mean (continuous)")
+
+
+class ReleaseMetricResult(StrictModel):
+    metric_key: str
+    role: Literal["primary", "guardrail"]
+    metric_type: MetricType
+    direction: OptimizationDirection
+    event_name: str
+    attribution_window_seconds: int
+    arms: dict[str, ReleaseArmRow]
+    effect: Optional[float] = Field(
+        default=None,
+        description="oriented effect: target - control in the favorable direction")
+    standard_error: Optional[float] = None
+    ci95: ConfidenceInterval = Field(default_factory=ConfidenceInterval)
+    threshold: float = Field(
+        description="min_favorable_effect (primary) or -non_inferiority_margin (guardrail)")
+    threshold_gap: Optional[float] = Field(
+        default=None,
+        description="effect - threshold; positive is on the favorable/safe side")
+    p_value: Optional[float] = Field(
+        default=None,
+        description="raw one-sided p-value: superiority (primary) or violation (guardrail)")
+    p_adjusted: Optional[float] = Field(
+        default=None, description="after the plan's Holm/Bonferroni correction")
+    evaluable: bool
+    not_evaluable_reason: Optional[str] = None
+    status: ReleaseMetricStatus
+    events_attributed: int
+    exclusions: dict[str, int] = Field(
+        description="event-level exclusion reasons, incl. window_incomplete_user "
+                    "and variant_not_in_plan")
+    excluded_users: dict[str, int] = Field(
+        description="user-level exclusions: window_incomplete / other_variant")
+    formula: str
+
+
+class ReleaseDecisionBlock(StrictModel):
+    decision: ReleaseDecision
+    reasons: list[str]
+    correction: CorrectionMethod
+    alpha: float
+    family_size: int = Field(
+        description="number of evaluable metrics in the correction family")
+    formula: str
+
+
+class ReleaseSnapshotResult(StrictModel):
+    metrics: list[ReleaseMetricResult]
+    decision: ReleaseDecisionBlock
+
+
+class ReleaseSnapshotOut(StrictModel):
+    plan_key: str
+    experiment_key: str
+    version_number: int
+    sequence: int
+    cutoff_at: datetime
+    submitted_at: datetime
+    duplicate: bool = False
+    result: ReleaseSnapshotResult
+    formulas: dict[str, str]
+
+
+class ReleaseSnapshotSummaryRow(StrictModel):
+    sequence: int
+    snapshot_id: int
+    cutoff_at: datetime
+    decision: ReleaseDecision
+    primary_status: ReleaseMetricStatus
+    guardrail_statuses: dict[str, ReleaseMetricStatus]
+    formula: str
+
+
+class ReleaseSnapshotHistoryResponse(StrictModel):
+    plan: ReleasePlanOut
+    snapshots: list[ReleaseSnapshotSummaryRow]

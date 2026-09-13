@@ -242,6 +242,79 @@ BEGIN
     SELECT RAISE(ABORT, 'cuped snapshots are immutable and cannot be deleted');
 END;
 
+-- ---------------------------------------------------------------------------
+-- Multi-metric release-decision plans and frozen decision snapshots.
+--
+-- A release plan is written BEFORE any exposure on the analyzed version (the
+-- API enforces this) and is immutable afterwards: no UPDATE endpoint exists
+-- and the triggers below block in-place changes at the storage layer. The
+-- plan pins one control/target variant pair, exactly one primary metric
+-- (with a minimum favorable effect) and any number of guardrail metrics
+-- (each with a non-inferiority margin), plus the multiple-comparison
+-- correction (Holm or Bonferroni). Snapshots freeze the full per-metric
+-- statistics and the ship / do-not-ship / insufficient-evidence decision at
+-- a cutoff instant: re-requesting the same cutoff re-serves the stored row
+-- verbatim and later events can never rewrite it.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS release_plans (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_key              TEXT NOT NULL UNIQUE,
+    experiment_key        TEXT NOT NULL REFERENCES experiments(key),
+    version_number        INTEGER NOT NULL,
+    control_variant_key   TEXT NOT NULL,
+    target_variant_key    TEXT NOT NULL,
+    primary_metric_key    TEXT NOT NULL,
+    primary_min_effect    REAL NOT NULL,
+    correction            TEXT NOT NULL CHECK (correction IN ('holm', 'bonferroni')),
+    alpha                 REAL NOT NULL,
+    guardrails_json       TEXT NOT NULL,
+    created_at            TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS release_snapshots (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_key         TEXT NOT NULL REFERENCES release_plans(plan_key),
+    sequence         INTEGER NOT NULL,
+    cutoff_at        TEXT NOT NULL,
+    decision         TEXT NOT NULL,
+    result_json      TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    UNIQUE (plan_key, cutoff_at),
+    UNIQUE (plan_key, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_plans_exp
+    ON release_plans (experiment_key, version_number);
+CREATE INDEX IF NOT EXISTS idx_release_snapshots_plan
+    ON release_snapshots (plan_key, sequence);
+
+-- Release plans and snapshots are write-once, exactly like CUPED plans:
+-- the storage layer refuses every modification or deletion outright.
+CREATE TRIGGER IF NOT EXISTS trg_release_plan_no_update
+BEFORE UPDATE ON release_plans
+BEGIN
+    SELECT RAISE(ABORT, 'release plans are immutable: create a new plan');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_release_plan_no_delete
+BEFORE DELETE ON release_plans
+BEGIN
+    SELECT RAISE(ABORT, 'release plans are immutable and cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_release_snapshot_no_update
+BEFORE UPDATE ON release_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'release snapshots are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_release_snapshot_no_delete
+BEFORE DELETE ON release_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'release snapshots are immutable and cannot be deleted');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_versions_exp_status
     ON experiment_versions (experiment_key, status);
 CREATE INDEX IF NOT EXISTS idx_versions_ns

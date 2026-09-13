@@ -24,6 +24,8 @@ from .routers.cuped import router as cuped_router
 from .routers.exposures import router as exposures_router
 from .routers.exposures import router_lookup as exposure_lookup_router
 from .routers.metrics import router as metrics_router
+from .routers.release import plans_router as release_plans_router
+from .routers.release import router as release_router
 from .routers.sequential import plans_router as sequential_plans_router
 from .routers.sequential import router as sequential_router
 
@@ -84,6 +86,8 @@ def create_app() -> FastAPI:
     app.include_router(sequential_router, prefix=api)
     app.include_router(cuped_plans_router, prefix=api)
     app.include_router(cuped_router, prefix=api)
+    app.include_router(release_plans_router, prefix=api)
+    app.include_router(release_router, prefix=api)
     return app
 
 

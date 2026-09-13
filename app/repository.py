@@ -1155,3 +1155,152 @@ def _cuped_snapshot_row(row: Any) -> dict[str, Any]:
     d["result"] = json.loads(d.pop("result_json"))
     return d
 
+
+# ---------------------------------------------------------------------------
+# Multi-metric release-decision plans + frozen decision snapshots
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReleasePlan:
+    id: int
+    plan_key: str
+    experiment_key: str
+    version_number: int
+    control_variant_key: str
+    target_variant_key: str
+    primary_metric_key: str
+    primary_min_effect: float
+    correction: str
+    alpha: float
+    guardrails: list[dict[str, Any]]
+    created_at: str
+
+
+def _row_to_release_plan(row: Any) -> ReleasePlan:
+    return ReleasePlan(
+        id=row["id"], plan_key=row["plan_key"],
+        experiment_key=row["experiment_key"],
+        version_number=row["version_number"],
+        control_variant_key=row["control_variant_key"],
+        target_variant_key=row["target_variant_key"],
+        primary_metric_key=row["primary_metric_key"],
+        primary_min_effect=row["primary_min_effect"],
+        correction=row["correction"], alpha=row["alpha"],
+        guardrails=json.loads(row["guardrails_json"]),
+        created_at=row["created_at"])
+
+
+def create_release_plan(spec: dict[str, Any]) -> ReleasePlan:
+    try:
+        with transaction() as tx:
+            cur = tx.execute(
+                "INSERT INTO release_plans (plan_key, experiment_key, "
+                " version_number, control_variant_key, target_variant_key, "
+                " primary_metric_key, primary_min_effect, correction, alpha, "
+                " guardrails_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (spec["plan_key"], spec["experiment_key"],
+                 spec["version_number"], spec["control_variant_key"],
+                 spec["target_variant_key"], spec["primary_metric_key"],
+                 spec["primary_min_effect"], spec["correction"],
+                 spec["alpha"], json.dumps(spec["guardrails"]),
+                 to_iso(utcnow())))
+            plan_id = cur.lastrowid
+    except Exception as exc:
+        if _is_unique(exc):
+            raise ConflictError(
+                "release_plan_exists",
+                f"release plan {spec['plan_key']!r} already exists")
+        raise
+    return get_release_plan_by_id(plan_id)
+
+
+def get_release_plan_by_id(plan_id: int) -> ReleasePlan:
+    row = get_conn().execute(
+        "SELECT * FROM release_plans WHERE id = ?", (plan_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"release plan id {plan_id} not found")
+    return _row_to_release_plan(row)
+
+
+def get_release_plan(plan_key: str) -> ReleasePlan:
+    row = get_conn().execute(
+        "SELECT * FROM release_plans WHERE plan_key = ?", (plan_key,)
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"release plan {plan_key!r} not found")
+    return _row_to_release_plan(row)
+
+
+def list_release_plans(experiment_key: str) -> list[ReleasePlan]:
+    get_experiment(experiment_key)  # 404 early
+    rows = get_conn().execute(
+        "SELECT * FROM release_plans WHERE experiment_key = ? "
+        "ORDER BY created_at, plan_key", (experiment_key,)).fetchall()
+    return [_row_to_release_plan(r) for r in rows]
+
+
+def insert_release_snapshot(plan_key: str, cutoff_iso: str, decision: str,
+                            result: dict[str, Any]
+                            ) -> tuple[bool, dict[str, Any]]:
+    """Insert a frozen release-decision snapshot; duplicate cutoff re-serves.
+
+    Returns (inserted_now, stored_row_dict). The duplicate-cutoff check and
+    the sequence allocation happen in one serialized write transaction, so
+    concurrent first-time submissions can never collide, and a re-requested
+    cutoff always returns the first frozen result unchanged.
+    """
+    with transaction() as tx:
+        existing = tx.execute(
+            "SELECT id FROM release_snapshots "
+            "WHERE plan_key = ? AND cutoff_at = ?",
+            (plan_key, cutoff_iso)).fetchone()
+        if existing is not None:
+            snapshot_id = existing["id"]
+            inserted = False
+        else:
+            next_sequence = tx.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next "
+                "FROM release_snapshots WHERE plan_key = ?",
+                (plan_key,)).fetchone()["next"]
+            cur = tx.execute(
+                "INSERT INTO release_snapshots (plan_key, sequence, "
+                " cutoff_at, decision, result_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (plan_key, next_sequence, cutoff_iso, decision,
+                 json.dumps(result), to_iso(utcnow())))
+            snapshot_id = cur.lastrowid
+            inserted = True
+    return inserted, get_release_snapshot_by_id(snapshot_id)
+
+
+def get_release_snapshot_by_id(snapshot_id: int) -> dict[str, Any]:
+    row = get_conn().execute(
+        "SELECT * FROM release_snapshots WHERE id = ?", (snapshot_id,)
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"release snapshot id {snapshot_id} not found")
+    return _release_snapshot_row(row)
+
+
+def get_release_snapshot_at(plan_key: str,
+                            cutoff_iso: str) -> Optional[dict[str, Any]]:
+    row = get_conn().execute(
+        "SELECT * FROM release_snapshots WHERE plan_key = ? AND cutoff_at = ?",
+        (plan_key, cutoff_iso)).fetchone()
+    return _release_snapshot_row(row) if row else None
+
+
+def list_release_snapshots(plan_key: str) -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT * FROM release_snapshots WHERE plan_key = ? ORDER BY sequence",
+        (plan_key,)).fetchall()
+    return [_release_snapshot_row(r) for r in rows]
+
+
+def _release_snapshot_row(row: Any) -> dict[str, Any]:
+    d = dict(row)
+    d["result"] = json.loads(d.pop("result_json"))
+    return d
+
